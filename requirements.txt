@@ -1,0 +1,4 @@
+pywebview==5.4
+pyinstaller==6.16.0
+cffi==2.0.0
+-r requirements-gateway.txt

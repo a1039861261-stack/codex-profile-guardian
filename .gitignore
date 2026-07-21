@@ -1,0 +1,45 @@
+# Dependencies and tool caches
+.venv/
+node_modules/
+.npm-cache/
+.playwright-cli/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Build and packaging output
+build/
+dist/
+output/
+
+# Local fixtures, diagnostics, and screenshots
+_tmp/
+qa/
+
+# Local runtime data and credentials
+.env
+.env.*
+!.env.example
+profiles.json
+events.jsonl
+auth.json
+session_index.jsonl
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.log
+*.dmp
+secrets/
+backups/
+*.dpapi
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini

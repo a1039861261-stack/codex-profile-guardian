@@ -68,6 +68,14 @@ class UIReleaseContractTests(unittest.TestCase):
         self.assertIn("手动同步额度", application)
         self.assertIn("手动检查更新", application)
 
+    def test_verified_background_update_prompts_once_per_app_session(self) -> None:
+        application = (self.project / "src" / "App.jsx").read_text(encoding="utf-8")
+        self.assertIn('const update = await api("/api/update")', application)
+        self.assertIn("window.setInterval(syncUpdateStatus, 5_000)", application)
+        self.assertIn('update?.state !== "downloaded"', application)
+        self.assertIn("updatePromptedVersion.current === version", application)
+        self.assertIn('setConfirmAction({ type: "update-install", version, automatic: true })', application)
+
     def test_product_styles_keep_an_eleven_pixel_font_floor(self) -> None:
         pattern = re.compile(r"font(?:-size)?\s*:[^;]*(?<!\d)(?:8|9|10)px")
         for stylesheet_path in (self.project / "src").rglob("*.css"):

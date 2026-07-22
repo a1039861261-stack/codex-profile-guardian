@@ -48,7 +48,7 @@ from gateway.protocols.responses import normalize_protocol_compatibility
 
 
 APP_NAME = "Codex Profile Guardian"
-APP_VERSION = "1.9.2"
+APP_VERSION = "1.9.3"
 SCHEMA_VERSION = 1
 MANAGED_START = "# BEGIN CODEX PROFILE GUARDIAN MANAGED"
 MANAGED_END = "# END CODEX PROFILE GUARDIAN MANAGED"
@@ -2040,6 +2040,36 @@ class GuardianService:
         finally:
             connection.close()
 
+    def _rollout_status(self) -> dict[str, Any]:
+        providers: dict[str, int] = {}
+        ids: dict[str, int] = {}
+        invalid = 0
+        total = 0
+        for path in self._rollout_files():
+            total += 1
+            try:
+                with path.open("rb") as source:
+                    first_line = source.readline()
+                item = json.loads(first_line.decode("utf-8", errors="strict"))
+                if not isinstance(item, dict):
+                    raise ValueError("session_meta is not an object")
+                payload = item.get("payload") if item.get("type") == "session_meta" else None
+                if not isinstance(payload, dict) or not str(payload.get("id") or "").strip():
+                    raise ValueError("missing session_meta id")
+                thread_id = str(payload["id"])
+                provider = str(payload.get("model_provider") or "")
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                invalid += 1
+                continue
+            providers[provider] = providers.get(provider, 0) + 1
+            ids[thread_id] = ids.get(thread_id, 0) + 1
+        return {
+            "total": total,
+            "providers": providers,
+            "invalid": invalid,
+            "duplicate_ids": sum(1 for count in ids.values() if count > 1),
+        }
+
     def status(self) -> dict[str, Any]:
         state = self._load_state()
         settings = state.setdefault("settings", {})
@@ -2048,12 +2078,24 @@ class GuardianService:
         settings.setdefault("auto_update_enabled", True)
         provider, model = self._read_config_provider()
         database = self._database_status()
-        shared_history_ready = (
-            database["total"] == 0
+        rollouts = self._rollout_status()
+        rollout_provider_ready = (
+            rollouts["total"] == 0
             or (
-                len(database["providers"]) == 1
-                and int(database["providers"].get(provider, 0)) == database["total"]
+                rollouts["invalid"] == 0
+                and len(rollouts["providers"]) == 1
+                and int(rollouts["providers"].get(provider, 0)) == rollouts["total"]
             )
+        )
+        shared_history_ready = (
+            (
+                database["total"] == 0
+                or (
+                    len(database["providers"]) == 1
+                    and int(database["providers"].get(provider, 0)) == database["total"]
+                )
+            )
+            and rollout_provider_ready
         )
         profiles = self.list_profiles()
         current_profile = next((p for p in profiles if p["current"]), None)
@@ -2072,6 +2114,7 @@ class GuardianService:
             "current_profile": current_profile,
             "profiles": profiles,
             "database": database,
+            "rollouts": rollouts,
             "backup_count": len(backups),
             "last_backup": backups[0] if backups else None,
             "health": {
@@ -2669,38 +2712,146 @@ class GuardianService:
             raise GuardianError(f"Codex config.toml 校验失败：{exc}") from exc
         atomic_write(config_path, text.encode("utf-8"))
 
-    def _rewrite_rollouts(
-        self, target_provider: str, rollout_paths: list[Path] | None = None
-    ) -> int:
-        if rollout_paths is None:
-            db = self._state_database_path()
-            if not db.is_file():
-                raise GuardianError(f"未找到 Codex 实际使用的 state_5.sqlite：{db}")
-            connection = sqlite3.connect(db, timeout=10)
+    @staticmethod
+    def _rollout_body_signature(path: Path) -> tuple[int, str]:
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as source:
+            source.readline()
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                size += len(chunk)
+                digest.update(chunk)
+        return size, digest.hexdigest()
+
+    @staticmethod
+    def _rollout_body_is_prefix(shorter: Path, longer: Path) -> bool:
+        with shorter.open("rb") as left, longer.open("rb") as right:
+            left.readline()
+            right.readline()
+            while True:
+                chunk = left.read(1024 * 1024)
+                if not chunk:
+                    return True
+                if right.read(len(chunk)) != chunk:
+                    return False
+
+    def _rollout_inventory(
+        self, *, verify_duplicate_bodies: bool = True
+    ) -> dict[str, Any]:
+        by_id: dict[str, list[dict[str, Any]]] = {}
+        entries: list[dict[str, Any]] = []
+        active_root = (self.codex_home / "sessions").resolve()
+        archived_root = (self.codex_home / "archived_sessions").resolve()
+        for path in self._rollout_files():
+            resolved = path.resolve()
             try:
-                rollout_paths = [
-                    Path(str(row[0]))
-                    for row in connection.execute(
-                        "SELECT rollout_path FROM threads WHERE rollout_path IS NOT NULL"
-                    )
-                ]
-            finally:
-                connection.close()
-        home = self.codex_home.resolve()
-        files = []
-        for candidate in rollout_paths:
-            path = candidate if candidate.is_absolute() else self.codex_home / candidate
-            try:
-                resolved = path.resolve()
-            except OSError:
+                with resolved.open("rb") as source:
+                    first_line = source.readline()
+                item = json.loads(first_line.decode("utf-8", errors="strict"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise GuardianError(f"发现无法解析的会话文件，已中止迁移：{resolved.name}") from exc
+            if not isinstance(item, dict):
+                raise GuardianError(f"会话文件首行不是 session_meta 对象，已中止迁移：{resolved.name}")
+            payload = item.get("payload") if item.get("type") == "session_meta" else None
+            thread_id = str(payload.get("id") or "").strip() if isinstance(payload, dict) else ""
+            if not thread_id:
+                raise GuardianError(f"会话文件缺少 session_meta ID，已中止迁移：{resolved.name}")
+            entry = {
+                "path": resolved,
+                "provider": str(payload.get("model_provider") or ""),
+                "archived": archived_root in resolved.parents,
+                "active": active_root in resolved.parents,
+            }
+            entries.append(entry)
+            by_id.setdefault(thread_id, []).append(entry)
+        duplicate_ids = 0
+        prefix_duplicate_ids = 0
+        divergent_duplicate_ids = 0
+        for items in by_id.values():
+            if len(items) < 2:
                 continue
-            if (
-                resolved.is_file()
-                and resolved.suffix.lower() == ".jsonl"
-                and (resolved == home or home in resolved.parents)
-            ):
-                files.append(resolved)
-        files = sorted(set(files), key=lambda item: str(item).lower())
+            duplicate_ids += 1
+            if not verify_duplicate_bodies:
+                continue
+            signatures = [self._rollout_body_signature(Path(item["path"])) for item in items]
+            if len(set(signatures)) == 1:
+                continue
+            largest_index = max(range(len(items)), key=lambda index: signatures[index][0])
+            largest = Path(items[largest_index]["path"])
+            prefix_safe = True
+            for index, item in enumerate(items):
+                if index == largest_index:
+                    continue
+                if not self._rollout_body_is_prefix(Path(item["path"]), largest):
+                    prefix_safe = False
+                    break
+            if prefix_safe:
+                prefix_duplicate_ids += 1
+            else:
+                divergent_duplicate_ids += 1
+        if divergent_duplicate_ids:
+            raise GuardianError(
+                f"发现 {divergent_duplicate_ids} 个正文冲突的重复会话 ID，已中止迁移，未选择或删除任何文件。"
+            )
+        return {
+            "by_id": by_id,
+            "entries": entries,
+            "duplicate_ids": duplicate_ids,
+            "prefix_duplicate_ids": prefix_duplicate_ids,
+        }
+
+    def _validate_rollout_inventory(
+        self, rows: list[tuple[Any, Any, Any]], inventory: dict[str, Any]
+    ) -> dict[str, int]:
+        by_id = inventory["by_id"]
+        database_ids = {str(row[0]) for row in rows}
+        missing = sorted(database_ids - set(by_id))
+        if missing:
+            raise GuardianError(
+                f"SQLite 中有 {len(missing)} 条会话找不到对应聊天文件，已中止迁移。"
+            )
+        archive_mismatches = 0
+        stale_paths = 0
+        for thread_id_raw, archived_raw, rollout_path_raw in rows:
+            thread_id = str(thread_id_raw)
+            entries = by_id[thread_id]
+            archived = bool(int(archived_raw or 0))
+            if not any(bool(entry["archived"]) == archived for entry in entries):
+                archive_mismatches += 1
+            if rollout_path_raw is None:
+                stale_paths += 1
+                continue
+            candidate = Path(str(rollout_path_raw))
+            if not candidate.is_absolute():
+                candidate = self.codex_home / candidate
+            try:
+                candidate = candidate.resolve()
+            except OSError:
+                stale_paths += 1
+                continue
+            if not any(candidate == entry["path"] for entry in entries):
+                stale_paths += 1
+        if archive_mismatches:
+            raise GuardianError(
+                f"发现 {archive_mismatches} 条会话的归档标记与文件位置不一致，已中止迁移。"
+            )
+        return {
+            "rollout_file_count": len(inventory["entries"]),
+            "duplicate_rollout_id_count": int(inventory["duplicate_ids"]),
+            "prefix_duplicate_rollout_id_count": int(inventory["prefix_duplicate_ids"]),
+            "orphan_rollout_count": len(set(by_id) - database_ids),
+            "stale_rollout_path_count": stale_paths,
+        }
+
+    def _rewrite_rollouts(
+        self, target_provider: str, inventory: dict[str, Any] | None = None
+    ) -> int:
+        if inventory is None:
+            inventory = self._rollout_inventory()
+        files = sorted(
+            (Path(item["path"]) for item in inventory["entries"]),
+            key=lambda item: str(item).lower(),
+        )
         changed_files = 0
         for path in files:
             original_stat = path.stat()
@@ -2744,6 +2895,68 @@ class GuardianService:
             changed_files += 1
         return changed_files
 
+    def _verify_history_provider(self, target_provider: str) -> dict[str, int]:
+        # Duplicate bodies are fully validated before the write transaction.
+        # Repeated post-write/startup checks only need first-line provider state;
+        # hashing large duplicate chat bodies here would make every poll expensive.
+        inventory = self._rollout_inventory(verify_duplicate_bodies=False)
+        rollout_mismatches = sum(
+            1 for item in inventory["entries"] if item["provider"] != target_provider
+        )
+        db = self._state_database_path()
+        connection = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=5)
+        try:
+            database_mismatches = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM threads WHERE model_provider IS NULL OR model_provider<>?",
+                    (target_provider,),
+                ).fetchone()[0]
+            )
+        finally:
+            connection.close()
+        return {
+            "database_provider_mismatch_count": database_mismatches,
+            "rollout_provider_mismatch_count": rollout_mismatches,
+            "rollout_files_verified": len(inventory["entries"]),
+            "duplicate_rollout_id_count": int(inventory["duplicate_ids"]),
+        }
+
+    def _post_launch_history_verification(
+        self, target_provider: str, launched: bool, timeout_seconds: float = 6.0
+    ) -> dict[str, Any]:
+        if self.is_fixture or not launched:
+            return {
+                "checked": False,
+                "verified": False,
+                "reason": "fixture" if self.is_fixture else "codex_not_launched",
+            }
+        deadline = time.time() + max(1.0, timeout_seconds)
+        stable_passes = 0
+        last: dict[str, Any] = {
+            "database_provider_mismatch_count": None,
+            "rollout_provider_mismatch_count": None,
+            "rollout_files_verified": 0,
+        }
+        time.sleep(0.8)
+        while time.time() < deadline:
+            try:
+                last = self._verify_history_provider(target_provider)
+            except (GuardianError, OSError, sqlite3.Error):
+                stable_passes = 0
+                time.sleep(0.5)
+                continue
+            if (
+                last["database_provider_mismatch_count"] == 0
+                and last["rollout_provider_mismatch_count"] == 0
+            ):
+                stable_passes += 1
+                if stable_passes >= 3:
+                    return {"checked": True, "verified": True, **last}
+            else:
+                stable_passes = 0
+            time.sleep(0.5)
+        return {"checked": True, "verified": False, **last}
+
     def _migrate_thread_provider(self, target_provider: str) -> dict[str, Any]:
         database_location = self._state_database_location()
         db = Path(database_location["path"])
@@ -2751,23 +2964,20 @@ class GuardianService:
             raise GuardianError(f"未找到 Codex 实际使用的 state_5.sqlite：{db}")
         connection = sqlite3.connect(db, timeout=30)
         connection.execute("PRAGMA busy_timeout=30000")
-        before_archived = {
-            row[0]: int(row[1]) for row in connection.execute("SELECT id, archived FROM threads")
-        }
         try:
+            thread_rows = list(
+                connection.execute("SELECT id, archived, rollout_path FROM threads ORDER BY id")
+            )
+            before_archived = {row[0]: int(row[1]) for row in thread_rows}
+            rollout_inventory = self._rollout_inventory()
+            rollout_preflight = self._validate_rollout_inventory(thread_rows, rollout_inventory)
             connection.execute("BEGIN IMMEDIATE")
             updated = connection.execute(
                 "UPDATE threads SET model_provider=? "
                 "WHERE model_provider IS NULL OR model_provider<>?",
                 (target_provider, target_provider),
             ).rowcount
-            rollout_paths = [
-                Path(str(row[0]))
-                for row in connection.execute(
-                    "SELECT rollout_path FROM threads WHERE rollout_path IS NOT NULL"
-                )
-            ]
-            changed_files = self._rewrite_rollouts(target_provider, rollout_paths)
+            changed_files = self._rewrite_rollouts(target_provider, rollout_inventory)
             provider_mismatches = list(
                 connection.execute(
                     "SELECT archived, COUNT(*) FROM threads "
@@ -2786,6 +2996,16 @@ class GuardianService:
                 raise GuardianError(
                     "聊天 provider 迁移不完整，已中止切换："
                     f"活动任务 {active_mismatches} 条，归档任务 {archived_mismatches} 条。"
+                )
+            rollout_mismatch_count = sum(
+                1
+                for item in self._rollout_inventory(verify_duplicate_bodies=False)["entries"]
+                if item["provider"] != target_provider
+            )
+            if rollout_mismatch_count:
+                raise GuardianError(
+                    "会话文件 provider 迁移不完整，已中止切换："
+                    f"{rollout_mismatch_count} 条。"
                 )
             index_path = self.codex_home / "session_index.jsonl"
             index_preserved = index_path.is_file()
@@ -2808,6 +3028,16 @@ class GuardianService:
             if integrity != "ok":
                 raise GuardianError(f"数据库完整性检查失败：{integrity}")
             connection.commit()
+            rollout_verification = self._verify_history_provider(target_provider)
+            if (
+                rollout_verification["database_provider_mismatch_count"]
+                or rollout_verification["rollout_provider_mismatch_count"]
+            ):
+                raise GuardianError(
+                    "本地聊天 provider 提交后复核失败："
+                    f"SQLite {rollout_verification['database_provider_mismatch_count']} 条，"
+                    f"会话文件 {rollout_verification['rollout_provider_mismatch_count']} 条。"
+                )
             return {
                 "database_rows_updated": updated,
                 "rollout_files_updated": changed_files,
@@ -2816,6 +3046,8 @@ class GuardianService:
                 "archived_count": sum(before_archived.values()),
                 "active_count": len(before_archived) - sum(before_archived.values()),
                 "provider_mismatch_count": 0,
+                **rollout_preflight,
+                **rollout_verification,
                 "active_rows_verified": len(before_archived) - sum(before_archived.values()),
                 "archive_preserved": True,
                 "database_path": str(db),
@@ -2868,7 +3100,7 @@ class GuardianService:
                 self._log(
                     "profile.switch",
                     "success",
-                    f"已切换到：{profile['name']}",
+                    f"已写入账号线路：{profile['name']}，等待 Codex 启动后复核",
                     profile_id=profile_id,
                     backup=backup["name"],
                     archived_count=migration["archived_count"],
@@ -2942,6 +3174,23 @@ class GuardianService:
             launched = False
             if self._load_state().get("settings", {}).get("auto_launch_codex", True):
                 launched = self.launch_codex()
+            post_restart = self._post_launch_history_verification(
+                profile["provider_id"], launched
+            )
+            migration["post_restart_verification"] = post_restart
+            migration["post_restart_verified"] = bool(post_restart.get("verified"))
+            self._log(
+                "history.post_restart",
+                "success" if post_restart.get("verified") else "error",
+                (
+                    "Codex 启动后本地聊天 provider 复核通过"
+                    if post_restart.get("verified")
+                    else "Codex 启动后本地聊天 provider 尚未通过复核"
+                ),
+                checked=bool(post_restart.get("checked")),
+                database_mismatches=post_restart.get("database_provider_mismatch_count"),
+                rollout_mismatches=post_restart.get("rollout_provider_mismatch_count"),
+            )
             return {
                 "profile": profile["name"],
                 "backup": backup,
@@ -3088,7 +3337,7 @@ class GuardianService:
                 self._log(
                     "history.repair",
                     "success",
-                    "共享聊天历史已统一到当前账号线路",
+                    "本地聊天 provider 已写入，等待 Codex 启动后复核",
                     provider=provider,
                     archived_count=result["archived_count"],
                     index_rows=result["index_rows"],
@@ -3099,6 +3348,21 @@ class GuardianService:
             launched = False
             if self._load_state().get("settings", {}).get("auto_launch_codex", True):
                 launched = self.launch_codex()
+            post_restart = self._post_launch_history_verification(provider, launched)
+            result["post_restart_verification"] = post_restart
+            result["post_restart_verified"] = bool(post_restart.get("verified"))
+            self._log(
+                "history.post_restart",
+                "success" if post_restart.get("verified") else "error",
+                (
+                    "Codex 启动后本地聊天 provider 复核通过"
+                    if post_restart.get("verified")
+                    else "Codex 启动后本地聊天 provider 尚未通过复核"
+                ),
+                checked=bool(post_restart.get("checked")),
+                database_mismatches=post_restart.get("database_provider_mismatch_count"),
+                rollout_mismatches=post_restart.get("rollout_provider_mismatch_count"),
+            )
             return {
                 "provider": provider,
                 "backup": backup,
@@ -3110,6 +3374,8 @@ class GuardianService:
                 "verification": {
                     "scope": result["verification_scope"],
                     "cross_auth_list_verified": result["cross_auth_list_verified"],
+                    "post_restart_verified": result["post_restart_verified"],
+                    "post_restart": result["post_restart_verification"],
                     "next_step": "switch_official_and_api_then_compare_task_list",
                 },
                 "launched": launched,

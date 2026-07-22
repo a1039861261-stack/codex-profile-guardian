@@ -202,6 +202,146 @@ class GuardianServiceTests(unittest.TestCase):
             self.assertFalse((profile_root / "state_5.sqlite").exists())
             self.assertFalse((profile_root / "session_index.jsonl").exists())
 
+    def test_switch_scans_stale_paths_and_orphan_rollouts_without_changing_chat_data(self) -> None:
+        profile = self.service.create_api_profile(
+            "Fixture API", "http://127.0.0.1:8317/v1", "secret-key", "gpt-test"
+        )
+        orphan_id = "019f330a-e611-70a2-8b98-74bcc83c5f80"
+        orphan_path = self.codex / "sessions" / "2026" / "07" / "06" / f"rollout-{orphan_id}.jsonl"
+        orphan_body = b'{"type":"response_item","payload":{"marker":"orphan-body"}}\n'
+        orphan_path.write_bytes(
+            json.dumps(
+                {"type": "session_meta", "payload": {"id": orphan_id, "model_provider": "custom"}},
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+            + orphan_body
+        )
+        active_body = b'{"type":"response_item","payload":{"marker":"active-body"}}\n'
+        archived_body = b'{"type":"response_item","payload":{"marker":"archived-body"}}\n'
+        self.active_path.write_bytes(self.active_path.read_bytes().split(b"\n", 1)[0] + b"\n" + active_body)
+        self.archived_path.write_bytes(
+            self.archived_path.read_bytes().split(b"\n", 1)[0] + b"\n" + archived_body
+        )
+        index_path = self.codex / "session_index.jsonl"
+        index_path.write_text(json.dumps({"id": self.active_id, "thread_name": "Keep"}) + "\n", encoding="utf-8")
+        index_before = index_path.read_bytes()
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        connection.execute(
+            "UPDATE threads SET rollout_path=? WHERE id=?",
+            (str(self.codex / "sessions" / "missing-rollout.jsonl"), self.active_id),
+        )
+        connection.execute("UPDATE threads SET rollout_path=NULL WHERE id=?", (self.archived_id,))
+        connection.commit()
+        connection.close()
+
+        result = self.service.switch_profile(profile["id"])["migration"]
+
+        self.assertEqual(result["stale_rollout_path_count"], 2)
+        self.assertEqual(result["orphan_rollout_count"], 1)
+        self.assertEqual(result["rollout_file_count"], 3)
+        self.assertEqual(result["rollout_files_verified"], 3)
+        self.assertEqual(result["rollout_provider_mismatch_count"], 0)
+        self.assertEqual(index_path.read_bytes(), index_before)
+        for path, expected_body in (
+            (self.active_path, active_body),
+            (self.archived_path, archived_body),
+            (orphan_path, orphan_body),
+        ):
+            first_line, body = path.read_bytes().split(b"\n", 1)
+            self.assertEqual(body, expected_body)
+            self.assertEqual(json.loads(first_line)["payload"]["model_provider"], profile["provider_id"])
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        rows = list(connection.execute("SELECT id, archived, model_provider FROM threads ORDER BY id"))
+        connection.close()
+        self.assertEqual({row[2] for row in rows}, {profile["provider_id"]})
+        self.assertEqual({row[0]: row[1] for row in rows}, {self.active_id: 0, self.archived_id: 1})
+
+    def test_switch_refuses_divergent_duplicate_rollouts_and_restores_config(self) -> None:
+        profile = self.service.create_api_profile(
+            "Fixture API", "http://127.0.0.1:8317/v1", "secret-key", "gpt-test"
+        )
+        self.active_path.write_bytes(
+            self.active_path.read_bytes().split(b"\n", 1)[0]
+            + b'\n{"type":"response_item","payload":{"marker":"original"}}\n'
+        )
+        duplicate = self.codex / "archived_sessions" / f"duplicate-{self.active_id}.jsonl"
+        duplicate.write_bytes(
+            json.dumps(
+                {"type": "session_meta", "payload": {"id": self.active_id, "model_provider": "openai"}},
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b'\n{"type":"response_item","payload":{"marker":"different"}}\n'
+        )
+        before = {
+            "config": (self.codex / "config.toml").read_bytes(),
+            "active": self.active_path.read_bytes(),
+            "duplicate": duplicate.read_bytes(),
+        }
+
+        with self.assertRaisesRegex(GuardianError, "正文冲突的重复会话 ID"):
+            self.service.switch_profile(profile["id"])
+
+        self.assertEqual((self.codex / "config.toml").read_bytes(), before["config"])
+        self.assertEqual(self.active_path.read_bytes(), before["active"])
+        self.assertEqual(duplicate.read_bytes(), before["duplicate"])
+        self.assertTrue(duplicate.is_file())
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        providers = {row[0] for row in connection.execute("SELECT model_provider FROM threads")}
+        connection.close()
+        self.assertEqual(providers, {"openai"})
+
+    def test_switch_rewrites_safe_duplicate_rollouts_without_selecting_or_deleting(self) -> None:
+        profile = self.service.create_api_profile(
+            "Fixture API", "http://127.0.0.1:8317/v1", "secret-key", "gpt-test"
+        )
+        common_body = b'{"type":"response_item","payload":{"marker":"same"}}\n'
+        first = self.active_path.read_bytes().split(b"\n", 1)[0] + b"\n"
+        self.active_path.write_bytes(first + common_body)
+        duplicate = self.codex / "archived_sessions" / f"duplicate-{self.active_id}.jsonl"
+        duplicate.write_bytes(first + common_body + b'{"type":"event_msg","payload":{"marker":"later"}}\n')
+        original_bodies = {
+            self.active_path: self.active_path.read_bytes().split(b"\n", 1)[1],
+            duplicate: duplicate.read_bytes().split(b"\n", 1)[1],
+        }
+
+        result = self.service.switch_profile(profile["id"])["migration"]
+
+        self.assertEqual(result["duplicate_rollout_id_count"], 1)
+        self.assertEqual(result["prefix_duplicate_rollout_id_count"], 1)
+        for path, body in original_bodies.items():
+            self.assertTrue(path.is_file())
+            first_line, current_body = path.read_bytes().split(b"\n", 1)
+            self.assertEqual(current_body, body)
+            self.assertEqual(json.loads(first_line)["payload"]["model_provider"], profile["provider_id"])
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        row = connection.execute(
+            "SELECT archived, rollout_path, model_provider FROM threads WHERE id=?",
+            (self.active_id,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(row, (0, str(self.active_path), profile["provider_id"]))
+
+    def test_status_detects_rollout_provider_reimport_after_database_migration(self) -> None:
+        profile = self.service.create_api_profile(
+            "Fixture API", "http://127.0.0.1:8317/v1", "secret-key", "gpt-test"
+        )
+        self.service.switch_profile(profile["id"])
+        first_line, body = self.active_path.read_bytes().split(b"\n", 1)
+        meta = json.loads(first_line)
+        meta["payload"]["model_provider"] = "openai"
+        self.active_path.write_bytes(
+            json.dumps(meta, separators=(",", ":")).encode("utf-8") + b"\n" + body
+        )
+
+        verification = self.service._verify_history_provider(profile["provider_id"])
+        status = self.service.status()
+
+        self.assertEqual(verification["database_provider_mismatch_count"], 0)
+        self.assertEqual(verification["rollout_provider_mismatch_count"], 1)
+        self.assertFalse(status["health"]["shared_history_ready"])
+        self.assertEqual(status["rollouts"]["providers"]["openai"], 1)
+
     def test_config_sqlite_home_takes_precedence_and_only_actual_database_changes(self) -> None:
         root = self.codex.parent
         config_sqlite_home = root / "config-sqlite-home"

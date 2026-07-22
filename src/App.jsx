@@ -51,7 +51,7 @@ const navItems = [
 const pageCopy = {
   overview: ["概览", "账号、会话与安全状态一眼看清"],
   accounts: ["账号", "管理官方登录与第三方 API"],
-  protection: ["聊天保护", "所有账号共享同一套聊天列表与归档状态"],
+  protection: ["聊天保护", "核对同一本地会话库、provider 标签与归档状态"],
   failover: ["API 容灾", "当前线路、故障原因与下一步"],
   backups: ["备份", "每次切换前自动留存配置与元数据回滚点"],
   logs: ["操作日志", "只记录结果，不记录 Token 或 API Key"],
@@ -749,7 +749,10 @@ function ClaudeProviderModal({ profile, onClose, onSaved, notify }) {
 
 function Protection({ status, onRepair, busy }) {
   const database = status?.database || {};
+  const rollouts = status?.rollouts || {};
   const providerEntries = Object.entries(database.providers || {});
+  const rolloutProviderEntries = Object.entries(rollouts.providers || {});
+  const sharedReady = Boolean(status?.health?.shared_history_ready);
   const databaseSource = database.source === "config.sqlite_home"
     ? "config.toml · sqlite_home"
     : database.source === "env.CODEX_SQLITE_HOME"
@@ -779,12 +782,21 @@ function Protection({ status, onRepair, busy }) {
         <section className="content-panel protection-card">
           <header>
             <div className="large-icon blue"><PlugsConnected weight="duotone" /></div>
-            <div><span>共享历史线路</span><h2>{providerEntries.length <= 1 ? "聊天列表已统一" : "需要同步"}</h2></div>
+            <div><span>本地 provider 一致性</span><h2>{sharedReady ? "数据库与会话文件一致" : "需要同步"}</h2></div>
           </header>
           <div className="provider-list">
             {providerEntries.map(([provider, count]) => (
-              <div key={provider}><code>{provider}</code><Badge tone={provider === status?.config_provider ? "success" : "warning"}>{count} 条</Badge></div>
+              <div key={`db-${provider}`}><code>SQLite · {provider}</code><Badge tone={provider === status?.config_provider ? "success" : "warning"}>{count} 条</Badge></div>
             ))}
+            {rolloutProviderEntries.map(([provider, count]) => (
+              <div key={`rollout-${provider}`}><code>会话文件 · {provider || "未标记"}</code><Badge tone={provider === status?.config_provider ? "success" : "warning"}>{count} 条</Badge></div>
+            ))}
+            {rollouts.invalid ? (
+              <div><code>文件结构异常</code><Badge tone="warning">{rollouts.invalid} 项</Badge></div>
+            ) : null}
+            {rollouts.duplicate_ids ? (
+              <div><code>保留的历史重复副本</code><Badge tone="success">{rollouts.duplicate_ids} 组</Badge></div>
+            ) : null}
           </div>
         </section>
       </div>
@@ -792,10 +804,11 @@ function Protection({ status, onRepair, busy }) {
         <div className="repair-visual"><ShieldCheck weight="duotone" /></div>
         <div className="repair-copy">
           <span className="eyebrow">共享历史修复</span>
-          <h2>保持聊天列表固定，只切换账号线路</h2>
-          <p>关闭 Codex 后，只在上方显示的实际 SQLite 中统一会话 provider 标签。聊天正文、顺序和归档状态不变；完成后请分别切换官方账号与 API 复核列表。</p>
+          <h2>统一数据库与全部会话文件，再复核登录后的列表</h2>
+          <p>关闭 Codex 后，同时核对实际 SQLite、sessions 与 archived_sessions 中的 provider 标签；聊天正文、ID、顺序和归档位置不变。Codex 重启后会再次只读复核，跨登录列表仍需实际切换确认。</p>
           <div className="safety-checks">
             <span><CheckCircle weight="fill" /> 自动识别 sqlite_home / CODEX_SQLITE_HOME</span>
+            <span><CheckCircle weight="fill" /> 扫描缺失或陈旧 rollout_path</span>
             <span><CheckCircle weight="fill" /> 保持 archived 标记</span>
             <span><CheckCircle weight="fill" /> 不修改旧的非活动 SQLite</span>
           </div>
@@ -1194,6 +1207,7 @@ export function App() {
   const [claudeProfileModal, setClaudeProfileModal] = useState(null);
   const [claudeAction, setClaudeAction] = useState(null);
   const quotaRefreshSignature = useRef("");
+  const updatePromptedVersion = useRef("");
 
   const notify = useCallback((message, tone = "success") => {
     setToast({ message, tone, id: Date.now() });
@@ -1247,6 +1261,16 @@ export function App() {
     }
   }, [notify]);
 
+  const refreshUpdateStatus = useCallback(async () => {
+    try {
+      const update = await api("/api/update");
+      setStatus((current) => current ? { ...current, update } : current);
+      return update;
+    } catch {
+      return null;
+    }
+  }, []);
+
   const refreshAll = useCallback(async () => {
     if (refreshing) return;
     setRefreshing(true);
@@ -1276,6 +1300,27 @@ export function App() {
   }, [refreshing, refreshOfficialQuotas, notify]);
 
   useEffect(() => { refresh(); }, [refresh]);
+
+  useEffect(() => {
+    if (!status || status.settings?.auto_update_enabled === false) return undefined;
+    const syncUpdateStatus = () => refreshUpdateStatus();
+    const timer = window.setInterval(syncUpdateStatus, 5_000);
+    window.addEventListener("focus", syncUpdateStatus);
+    syncUpdateStatus();
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", syncUpdateStatus);
+    };
+  }, [Boolean(status), status?.settings?.auto_update_enabled, refreshUpdateStatus]);
+
+  useEffect(() => {
+    const update = status?.update;
+    const version = update?.latest_version;
+    if (busy || confirmAction || update?.state !== "downloaded" || !version) return;
+    if (updatePromptedVersion.current === version) return;
+    updatePromptedVersion.current = version;
+    setConfirmAction({ type: "update-install", version, automatic: true });
+  }, [status?.update?.state, status?.update?.latest_version, busy, confirmAction]);
 
   useEffect(() => {
     if (route === "claude") refreshClaude();
@@ -1344,7 +1389,16 @@ export function App() {
     if (!action) return;
     let result;
     if (action.type === "switch") {
-      result = await run(() => api(`/api/profiles/${action.profile.id}/switch`, { method: "POST", body: "{}" }), `已切换到 ${action.profile.name}`);
+      result = await run(() => api(`/api/profiles/${action.profile.id}/switch`, { method: "POST", body: "{}" }), null);
+      if (result) {
+        const verification = result.migration?.post_restart_verification;
+        notify(
+          verification?.verified
+            ? `已切换到 ${action.profile.name}，Codex 重启后本地聊天复核通过`
+            : `已切换到 ${action.profile.name}，请在 Codex 中复核任务列表`,
+          verification?.verified ? "success" : "warning",
+        );
+      }
     } else if (action.type === "sync") {
       result = await run(() => api(`/api/profiles/${action.profile.id}/sync`, { method: "POST", body: "{}" }), `${action.profile.name} 的登录凭据已更新`);
     } else if (action.type === "remote-sync") {
@@ -1386,7 +1440,16 @@ export function App() {
         onDelete={(profile) => setConfirmAction({ type: "delete", profile })}
       />
     );
-    if (route === "protection") return <Protection status={status} busy={busy} onRepair={() => run(() => api("/api/protection/repair", { method: "POST", body: "{}" }), "实际聊天库标签已修复，请切换账号复核")} />;
+    if (route === "protection") return <Protection status={status} busy={busy} onRepair={async () => {
+      const result = await run(() => api("/api/protection/repair", { method: "POST", body: "{}" }), null);
+      if (!result) return;
+      notify(
+        result.verification?.post_restart_verified
+          ? "数据库与全部会话文件已统一，Codex 重启后复核通过"
+          : "本地 provider 已统一，请切换官方账号与 API 复核任务列表",
+        result.verification?.post_restart_verified ? "success" : "warning",
+      );
+    }} />;
     if (route === "failover") return <FailoverPage client={failoverApiClient} onNavigateAccounts={() => setRoute("accounts")} />;
     if (route === "claude") return (
       <ClaudeDesktopPage

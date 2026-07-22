@@ -8,13 +8,14 @@ Codex Profile Guardian 是一个面向 Windows 的本地管理工具，用于安
 
 ## 当前状态
 
+- `v1.9.3` 修复 SQLite 已迁移但旧会话文件在 Codex 重启后重新导入旧 provider 的问题：账号/API 切换会扫描 `sessions` 与 `archived_sessions` 的全部 rollout，兼容缺失或陈旧 `rollout_path`、数据库外孤立文件及正文一致/前缀关系的历史重复副本；正文真正冲突时安全中止并回滚。启动后还会连续只读复核本地 provider，一旦有新版本完成下载与校验，应用会弹出确认界面，也可在设置页手动检查和安装。
 - `v1.9.2` 修复自定义 `sqlite_home` / `CODEX_SQLITE_HOME` 电脑上账号与 API 切换后任务列表分裂：Guardian 现在只迁移 Codex 实际使用的 SQLite，并在聊天保护页明确显示数据库来源和路径。
 - `v1.9.1` 提高全软件最小字体，修复禁用主按钮文字对比度；概览额度区移除外层底框，三个摘要矩形等高横向排列，并新增手动同步额度入口。
 - `v1.9.0` 已正式发布，新增正式 GitHub Release 自动检查与预下载、安装前显式确认、版本化资产与 SHA-256 校验，并重做额度摘要、刷新反馈、账号按钮和当前卡片视觉层级。
 - `v1.8.7` 修复 Windows Store Codex CLI 无法直接执行导致的额度同步丢失，增加每 60 秒后台刷新，并统一应用、快捷方式和安装程序的 Guardian 盾牌图标。
 - `v1.8.6` 修复本机账号切换后的“项目存在但无任务”半切换：活动任务与归档任务必须全部迁移到目标 provider；任一任务仍保留旧 provider 时，切换会在提交前失败并自动回滚。
-- 当前真实安装版：`v1.8.7`；不可覆盖的回滚基线仍为 `v1.6.2`。
-- `main`：包含尚未安装或发布的下一版本开发工作，不应直接描述为当前安装版。
+- 当前正式发布版：`v1.9.3`；不可覆盖的回滚基线仍为 `v1.6.2`。
+- `main`：对应公开源码快照；客户端自动更新只读取正式 GitHub Release，不跟随普通提交。
 - 首发目标：用户自己的 Windows 本地电脑。
 - Linux/NAS：代码和等价运行时测试已存在，但没有完成真实 NAS 现场验收，当前仅为实验性扩展。
 - 源码变更通过分支和 Pull Request 审核；客户端更新只跟随正式 Release，不跟随普通提交。
@@ -52,6 +53,7 @@ Codex Profile Guardian 是一个面向 Windows 的本地管理工具，用于安
 
 - 容灾数据面不得读取或修改 Codex 的聊天正文、归档、`state_5.sqlite*` 或 `session_index.jsonl`。
 - 当前电脑始终只使用一套本地 Codex 聊天库；切换官方账号或 API 只协调 provider 元数据，不创建按账号分隔的 sessions、SQLite 或索引，也不改变任务 ID、正文和归档状态。
+- 本地聊天协调会同时核对实际 SQLite 与全部 rollout 首行；安全的历史重复副本全部保留并统一 provider，正文冲突的重复 ID 会阻止切换，不会自动选择、合并或删除文件。
 - 日志和诊断包不得保存 prompt、response、工具参数、Authorization、Cookie 或真实 Key。
 - 官方账号继续使用官方认证直连；Guardian 不反代 OAuth。
 - 只有在上游完整响应尚未向 Codex 提交时，才允许切换备用线路。

@@ -48,7 +48,7 @@ from gateway.protocols.responses import normalize_protocol_compatibility
 
 
 APP_NAME = "Codex Profile Guardian"
-APP_VERSION = "1.9.1"
+APP_VERSION = "1.9.2"
 SCHEMA_VERSION = 1
 MANAGED_START = "# BEGIN CODEX PROFILE GUARDIAN MANAGED"
 MANAGED_END = "# END CODEX PROFILE GUARDIAN MANAGED"
@@ -1923,8 +1923,85 @@ class GuardianService:
             model_match.group(1) if model_match else "",
         )
 
+    @staticmethod
+    def _resolve_sqlite_home_path(raw: str) -> Path:
+        value = raw.strip()
+        if not value:
+            raise GuardianError("Codex SQLite 目录配置为空。")
+        directory = Path(value).expanduser()
+        if not directory.is_absolute():
+            directory = Path.cwd() / directory
+        return directory.resolve()
+
+    def _state_database_location(self) -> dict[str, Any]:
+        """Resolve the SQLite database Codex itself will use.
+
+        Codex gives the top-level ``sqlite_home`` config key precedence over
+        ``CODEX_SQLITE_HOME``.  Without either override, SQLite lives under
+        ``CODEX_HOME``.  Relative overrides intentionally resolve from the
+        current working directory to match Codex's documented behavior.
+        """
+
+        config_path = self.codex_home / "config.toml"
+        config_text = (
+            config_path.read_text(encoding="utf-8-sig", errors="strict")
+            if config_path.is_file()
+            else ""
+        )
+        configured_sqlite_home: Any = None
+        if config_text:
+            try:
+                config = tomllib.loads(config_text)
+            except tomllib.TOMLDecodeError as exc:
+                raise GuardianError(f"Codex config.toml 无法解析，不能安全定位聊天数据库：{exc}") from exc
+            configured_sqlite_home = config.get("sqlite_home")
+
+        if configured_sqlite_home is not None:
+            if not isinstance(configured_sqlite_home, str):
+                raise GuardianError("Codex sqlite_home 必须是目录字符串。")
+            directory = self._resolve_sqlite_home_path(configured_sqlite_home)
+            source = "config.sqlite_home"
+        else:
+            environment_sqlite_home = os.environ.get("CODEX_SQLITE_HOME", "").strip()
+            if environment_sqlite_home:
+                directory = self._resolve_sqlite_home_path(environment_sqlite_home)
+                source = "env.CODEX_SQLITE_HOME"
+            else:
+                directory = self.codex_home
+                source = "codex_home"
+
+        if directory.exists() and not directory.is_dir():
+            raise GuardianError(f"Codex SQLite 目录不是文件夹：{directory}")
+        database = (directory / "state_5.sqlite").resolve()
+        if database.name != "state_5.sqlite":
+            raise GuardianError("Codex SQLite 数据库路径无效。")
+        return {
+            "path": database,
+            "directory": directory,
+            "source": source,
+            "override": source != "codex_home",
+        }
+
+    def _state_database_path(self) -> Path:
+        return Path(self._state_database_location()["path"])
+
     def _database_status(self) -> dict[str, Any]:
-        db = self.codex_home / "state_5.sqlite"
+        try:
+            location = self._state_database_location()
+        except GuardianError as exc:
+            return {
+                "exists": False,
+                "integrity": "resolution_error",
+                "total": 0,
+                "active": 0,
+                "archived": 0,
+                "providers": {},
+                "path": None,
+                "source": "unresolved",
+                "override": False,
+                "resolution_error": str(exc),
+            }
+        db = Path(location["path"])
         if not db.is_file():
             return {
                 "exists": False,
@@ -1933,6 +2010,9 @@ class GuardianService:
                 "active": 0,
                 "archived": 0,
                 "providers": {},
+                "path": str(db),
+                "source": location["source"],
+                "override": location["override"],
             }
         connection = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=5)
         try:
@@ -1953,6 +2033,9 @@ class GuardianService:
                 "active": active,
                 "archived": archived,
                 "providers": providers,
+                "path": str(db),
+                "source": location["source"],
+                "override": location["override"],
             }
         finally:
             connection.close()
@@ -2387,7 +2470,8 @@ class GuardianService:
                 copied.append(self._copy_backup_file(path, backup_root))
         rollout_files = self._rollout_files()
         rollout_snapshot = self._snapshot_rollout_first_lines(backup_root, rollout_files)
-        db = self.codex_home / "state_5.sqlite"
+        database_location = self._state_database_location()
+        db = Path(database_location["path"])
         archived_flags: dict[str, int] = {}
         if db.is_file():
             source = sqlite3.connect(db, timeout=30)
@@ -2405,6 +2489,12 @@ class GuardianService:
             "created_at": utc_now(),
             "reason": reason,
             "codex_home": str(self.codex_home),
+            "state_database": {
+                "path": str(db),
+                "source": database_location["source"],
+                "override": database_location["override"],
+                "stored": "state_5.sqlite" if db.is_file() else None,
+            },
             "backup_mode": "lightweight-first-line",
             "copied_files": copied,
             "sensitive_files_encrypted": encrypted_files,
@@ -2441,6 +2531,8 @@ class GuardianService:
             "active_count": manifest.get("active_count", 0),
             "rollout_file_count": manifest.get("rollout_file_count", 0),
             "backup_mode": manifest.get("backup_mode", "full"),
+            "state_database_source": (manifest.get("state_database") or {}).get("source"),
+            "state_database_path": (manifest.get("state_database") or {}).get("path"),
             "size_mb": round(bytes_total / (1024 * 1024), 2),
         }
 
@@ -2484,9 +2576,27 @@ class GuardianService:
             atomic_write(self.codex_home / "auth.json", restored_auth)
         backup_db = backup_root / "state_5.sqlite"
         if backup_db.is_file():
-            target_db = self.codex_home / "state_5.sqlite"
+            manifest_path = backup_root / "manifest.json"
+            manifest = read_json_file(manifest_path) if manifest_path.is_file() else {}
+            state_database = manifest.get("state_database") or {}
+            recorded_path = state_database.get("path")
+            if recorded_path:
+                target_db = Path(str(recorded_path)).expanduser().resolve()
+                if target_db.name != "state_5.sqlite":
+                    raise GuardianError("备份记录的 SQLite 路径无效。")
+                current_db = self._state_database_path()
+                if target_db != current_db:
+                    raise GuardianError(
+                        "Codex SQLite 位置已变化，拒绝把备份恢复到另一套聊天库。"
+                    )
+            else:
+                # Legacy backups were always taken from CODEX_HOME/state_5.sqlite.
+                # Preserve that exact target instead of redirecting an old backup
+                # into a newer sqlite_home override.
+                target_db = (self.codex_home / "state_5.sqlite").resolve()
+            target_db.parent.mkdir(parents=True, exist_ok=True)
             for suffix in ("-wal", "-shm"):
-                (self.codex_home / f"state_5.sqlite{suffix}").unlink(missing_ok=True)
+                target_db.with_name(f"state_5.sqlite{suffix}").unlink(missing_ok=True)
             temp_db = target_db.with_name(f"state_5.sqlite.{uuid.uuid4().hex}.restore.tmp")
             try:
                 shutil.copy2(backup_db, temp_db)
@@ -2563,9 +2673,9 @@ class GuardianService:
         self, target_provider: str, rollout_paths: list[Path] | None = None
     ) -> int:
         if rollout_paths is None:
-            db = self.codex_home / "state_5.sqlite"
+            db = self._state_database_path()
             if not db.is_file():
-                raise GuardianError("未找到 state_5.sqlite，无法定位聊天正文。")
+                raise GuardianError(f"未找到 Codex 实际使用的 state_5.sqlite：{db}")
             connection = sqlite3.connect(db, timeout=10)
             try:
                 rollout_paths = [
@@ -2635,9 +2745,10 @@ class GuardianService:
         return changed_files
 
     def _migrate_thread_provider(self, target_provider: str) -> dict[str, Any]:
-        db = self.codex_home / "state_5.sqlite"
+        database_location = self._state_database_location()
+        db = Path(database_location["path"])
         if not db.is_file():
-            raise GuardianError("未找到 state_5.sqlite，无法保护聊天记录。")
+            raise GuardianError(f"未找到 Codex 实际使用的 state_5.sqlite：{db}")
         connection = sqlite3.connect(db, timeout=30)
         connection.execute("PRAGMA busy_timeout=30000")
         before_archived = {
@@ -2707,6 +2818,8 @@ class GuardianService:
                 "provider_mismatch_count": 0,
                 "active_rows_verified": len(before_archived) - sum(before_archived.values()),
                 "archive_preserved": True,
+                "database_path": str(db),
+                "database_source": database_location["source"],
             }
         except Exception:
             connection.rollback()
@@ -2970,6 +3083,8 @@ class GuardianService:
             try:
                 result = self._migrate_thread_provider(provider)
                 result["shared_history_preserved"] = True
+                result["verification_scope"] = "local_sqlite_provider"
+                result["cross_auth_list_verified"] = False
                 self._log(
                     "history.repair",
                     "success",
@@ -2988,6 +3103,15 @@ class GuardianService:
                 "provider": provider,
                 "backup": backup,
                 "migration": result,
+                "database": {
+                    "path": result["database_path"],
+                    "source": result["database_source"],
+                },
+                "verification": {
+                    "scope": result["verification_scope"],
+                    "cross_auth_list_verified": result["cross_auth_list_verified"],
+                    "next_step": "switch_official_and_api_then_compare_task_list",
+                },
                 "launched": launched,
             }
 

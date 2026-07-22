@@ -215,8 +215,46 @@ def stop_app_server():
         raise RuntimeError("codex app-server could not be stopped")
     return {"before": len(before), "after": 0}
 
-def ensure_no_recent_active_turn(home):
-    db = home / "state_5.sqlite"
+def resolve_user_path(raw):
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    if value == "~":
+        return Path.home()
+    if value.startswith("~/") or value.startswith("~\\"):
+        return Path.home() / value[2:]
+    path = Path(value)
+    return path if path.is_absolute() else Path.cwd() / path
+
+def state_db_location(home, config_text):
+    configured = None
+    if tomllib is not None:
+        try:
+            configured = tomllib.loads(config_text).get("sqlite_home")
+        except Exception as exc:
+            raise RuntimeError("invalid config.toml; cannot resolve sqlite_home") from exc
+    else:
+        match = re.search(r'(?m)^sqlite_home\s*=\s*"([^"]+)"\s*$', config_text)
+        configured = match.group(1) if match else None
+    if configured is not None:
+        if not isinstance(configured, str) or not configured.strip():
+            raise RuntimeError("sqlite_home must be a non-empty string")
+        directory = resolve_user_path(configured)
+        source = "config.sqlite_home"
+    else:
+        environment = os.environ.get("CODEX_SQLITE_HOME", "").strip()
+        if environment:
+            directory = resolve_user_path(environment)
+            source = "env.CODEX_SQLITE_HOME"
+        else:
+            directory = home
+            source = "codex_home"
+    directory = directory.resolve()
+    if directory.exists() and not directory.is_dir():
+        raise RuntimeError("sqlite_home is not a directory")
+    return (directory / "state_5.sqlite").resolve(), source
+
+def ensure_no_recent_active_turn(db):
     if not db.is_file():
         return
     import sqlite3
@@ -249,8 +287,7 @@ def ensure_no_recent_active_turn(home):
     if busy:
         raise RuntimeError("SSH Codex still has an active turn; retry after it finishes: " + ", ".join(busy[:3]))
 
-def repair_thread_provider(home, target_provider):
-    db = home / "state_5.sqlite"
+def repair_thread_provider(db, target_provider):
     if not target_provider or not db.is_file():
         return {"updated": 0, "integrity": "missing"}
     import sqlite3
@@ -277,26 +314,27 @@ if payload is None:
     payload = json.load(sys.stdin)
 home = Path.home() / ".codex"
 home.mkdir(parents=True, exist_ok=True)
-ensure_no_recent_active_turn(home)
+config_path = home / "config.toml"
+config_before = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
+state_db, state_db_source = state_db_location(home, config_before)
+ensure_no_recent_active_turn(state_db)
 app_server = stop_app_server()
 stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
 backup = home / "guardian-backups" / stamp
 backup.mkdir(parents=True, exist_ok=False)
 auth_path = home / "auth.json"
-config_path = home / "config.toml"
-for source in (
-    auth_path,
-    config_path,
-    home / "state_5.sqlite",
-    home / "state_5.sqlite-wal",
-    home / "state_5.sqlite-shm",
-    home / "session_index.jsonl",
+for source, stored_name in (
+    (auth_path, "auth.json"),
+    (config_path, "config.toml"),
+    (state_db, "state_5.sqlite"),
+    (state_db.with_name("state_5.sqlite-wal"), "state_5.sqlite-wal"),
+    (state_db.with_name("state_5.sqlite-shm"), "state_5.sqlite-shm"),
+    (home / "session_index.jsonl", "session_index.jsonl"),
 ):
     if source.is_file():
-        shutil.copy2(source, backup / source.name)
+        shutil.copy2(source, backup / stored_name)
 
 auth_bytes = base64.b64decode(payload["auth_b64"])
-config_before = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
 lines = config_before.splitlines()
 lines = remove_top_keys(lines, {"preferred_auth_method"})
 portable = payload.get("portable_config") or {}
@@ -311,7 +349,7 @@ if tomllib is not None:
     tomllib.loads(config_after)
 atomic_write(auth_path, auth_bytes, 0o600)
 atomic_write(config_path, config_after.encode("utf-8"), 0o600)
-print(json.dumps({"ok": True, "backup": backup.name, "config_bytes": len(config_after.encode("utf-8")), "app_server": app_server, "history": {"shared_history_reconcile_pending": True}}))
+print(json.dumps({"ok": True, "backup": backup.name, "config_bytes": len(config_after.encode("utf-8")), "app_server": app_server, "history": {"shared_history_reconcile_pending": True, "database_source": state_db_source}}))
 '''
 
 _REMOTE_API_APPLY_SCRIPT = r'''
@@ -437,8 +475,46 @@ def stop_app_server():
         raise RuntimeError("codex app-server could not be stopped")
     return {"before": len(before), "after": 0}
 
-def ensure_no_recent_active_turn(home):
-    db = home / "state_5.sqlite"
+def resolve_user_path(raw):
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    if value == "~":
+        return Path.home()
+    if value.startswith("~/") or value.startswith("~\\"):
+        return Path.home() / value[2:]
+    path = Path(value)
+    return path if path.is_absolute() else Path.cwd() / path
+
+def state_db_location(home, config_text):
+    configured = None
+    if tomllib is not None:
+        try:
+            configured = tomllib.loads(config_text).get("sqlite_home")
+        except Exception as exc:
+            raise RuntimeError("invalid config.toml; cannot resolve sqlite_home") from exc
+    else:
+        match = re.search(r'(?m)^sqlite_home\s*=\s*"([^"]+)"\s*$', config_text)
+        configured = match.group(1) if match else None
+    if configured is not None:
+        if not isinstance(configured, str) or not configured.strip():
+            raise RuntimeError("sqlite_home must be a non-empty string")
+        directory = resolve_user_path(configured)
+        source = "config.sqlite_home"
+    else:
+        environment = os.environ.get("CODEX_SQLITE_HOME", "").strip()
+        if environment:
+            directory = resolve_user_path(environment)
+            source = "env.CODEX_SQLITE_HOME"
+        else:
+            directory = home
+            source = "codex_home"
+    directory = directory.resolve()
+    if directory.exists() and not directory.is_dir():
+        raise RuntimeError("sqlite_home is not a directory")
+    return (directory / "state_5.sqlite").resolve(), source
+
+def ensure_no_recent_active_turn(db):
     if not db.is_file():
         return
     import sqlite3
@@ -471,8 +547,7 @@ def ensure_no_recent_active_turn(home):
     if busy:
         raise RuntimeError("SSH Codex still has an active turn; retry after it finishes: " + ", ".join(busy[:3]))
 
-def repair_thread_provider(home, target_provider):
-    db = home / "state_5.sqlite"
+def repair_thread_provider(db, target_provider):
     if not target_provider or not db.is_file():
         return {"updated": 0, "integrity": "missing"}
     import sqlite3
@@ -504,22 +579,24 @@ if not re.fullmatch(r"[A-Za-z0-9_.-]+", provider_id):
 
 home = Path.home() / ".codex"
 home.mkdir(parents=True, exist_ok=True)
-ensure_no_recent_active_turn(home)
+config_path = home / "config.toml"
+config_before = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
+state_db, state_db_source = state_db_location(home, config_before)
+ensure_no_recent_active_turn(state_db)
 app_server = stop_app_server()
 stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
 backup = home / "guardian-backups" / stamp
 backup.mkdir(parents=True, exist_ok=False)
-config_path = home / "config.toml"
 if config_path.is_file():
     shutil.copy2(config_path, backup / "config.toml")
-for source in (
-    home / "state_5.sqlite",
-    home / "state_5.sqlite-wal",
-    home / "state_5.sqlite-shm",
-    home / "session_index.jsonl",
+for source, stored_name in (
+    (state_db, "state_5.sqlite"),
+    (state_db.with_name("state_5.sqlite-wal"), "state_5.sqlite-wal"),
+    (state_db.with_name("state_5.sqlite-shm"), "state_5.sqlite-shm"),
+    (home / "session_index.jsonl", "session_index.jsonl"),
 ):
     if source.is_file():
-        shutil.copy2(source, backup / source.name)
+        shutil.copy2(source, backup / stored_name)
 
 api_dir = home / "guardian-api-profiles"
 api_dir.mkdir(parents=True, exist_ok=True)
@@ -528,7 +605,6 @@ key_path = api_dir / f"{provider_id}.key"
 api_key = base64.b64decode(payload["api_key_b64"])
 atomic_write(key_path, api_key, 0o600)
 
-config_before = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
 lines = remove_managed_blocks(config_before).splitlines()
 lines = remove_top_keys(lines, {"preferred_auth_method"})
 portable = payload.get("portable_config") or {}
@@ -571,7 +647,7 @@ print(json.dumps({
     "provider_id": provider_id,
     "key_path": str(key_path),
     "app_server": app_server,
-    "history": {"shared_history_reconcile_pending": True},
+    "history": {"shared_history_reconcile_pending": True, "database_source": state_db_source},
 }))
 '''
 
@@ -612,12 +688,49 @@ def _run_ssh(
 
 
 _REMOTE_RECONCILE_SCRIPT = r'''
-import base64, datetime, hashlib, json, os, shutil, sqlite3, subprocess, time
+import base64, datetime, hashlib, json, os, re, shutil, sqlite3, subprocess, time
 from pathlib import Path
 try:
     import tomllib
 except Exception:
     tomllib = None
+
+def resolve_user_path(raw):
+    value = str(raw or "").strip()
+    if value == "~":
+        return Path.home()
+    if value.startswith("~/") or value.startswith("~\\"):
+        return Path.home() / value[2:]
+    path = Path(value)
+    return path if path.is_absolute() else Path.cwd() / path
+
+def state_db_location(home, config_text):
+    configured = None
+    if tomllib is not None:
+        try:
+            configured = tomllib.loads(config_text).get("sqlite_home")
+        except Exception as exc:
+            raise RuntimeError("invalid config.toml; cannot resolve sqlite_home") from exc
+    else:
+        match = re.search(r'(?m)^sqlite_home\s*=\s*"([^"]+)"\s*$', config_text)
+        configured = match.group(1) if match else None
+    if configured is not None:
+        if not isinstance(configured, str) or not configured.strip():
+            raise RuntimeError("sqlite_home must be a non-empty string")
+        directory = resolve_user_path(configured)
+        source = "config.sqlite_home"
+    else:
+        environment = os.environ.get("CODEX_SQLITE_HOME", "").strip()
+        if environment:
+            directory = resolve_user_path(environment)
+            source = "env.CODEX_SQLITE_HOME"
+        else:
+            directory = home
+            source = "codex_home"
+    directory = directory.resolve()
+    if directory.exists() and not directory.is_dir():
+        raise RuntimeError("sqlite_home is not a directory")
+    return (directory / "state_5.sqlite").resolve(), source
 
 home = Path.home() / ".codex"
 sessions_root = (home / "sessions").resolve()
@@ -637,9 +750,9 @@ if not target:
             break
 if not target:
     target = "openai"
-db = home / "state_5.sqlite"
+db, database_source = state_db_location(home, config_text)
 if not db.is_file():
-    raise RuntimeError("state_5.sqlite missing")
+    raise RuntimeError("active state_5.sqlite missing: " + str(db))
 
 def stop_app_server():
     if os.name != "posix" or shutil.which("pgrep") is None or shutil.which("pkill") is None:
@@ -776,10 +889,14 @@ app_server = stop_app_server()
 stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
 backup = home / "guardian-backups" / (stamp + "-shared-history-reconcile")
 backup.mkdir(parents=True, exist_ok=False)
-for name in ("state_5.sqlite", "state_5.sqlite-wal", "state_5.sqlite-shm", "session_index.jsonl"):
-    source = home / name
+for source, stored_name in (
+    (db, "state_5.sqlite"),
+    (db.with_name("state_5.sqlite-wal"), "state_5.sqlite-wal"),
+    (db.with_name("state_5.sqlite-shm"), "state_5.sqlite-shm"),
+    (home / "session_index.jsonl", "session_index.jsonl"),
+):
     if source.is_file():
-        shutil.copy2(source, backup / name)
+        shutil.copy2(source, backup / stored_name)
 
 connection = sqlite3.connect(str(db), timeout=15)
 connection.execute("PRAGMA busy_timeout=15000")
@@ -934,6 +1051,8 @@ try:
         "archive_preserved": True,
         "shared_history_preserved": True,
         "integrity": integrity,
+        "database_path": str(db),
+        "database_source": database_source,
         "backup": backup.name,
         "app_server": app_server,
         "paths": {thread_id: str(plan["final"]) for thread_id, plan in plans.items()},
@@ -968,15 +1087,54 @@ print(json.dumps(result, ensure_ascii=False))
 
 
 _REMOTE_VERIFY_SCRIPT = r'''
-import hashlib, json, sqlite3, time
+import hashlib, json, os, re, sqlite3, time
 from pathlib import Path
+try:
+    import tomllib
+except Exception:
+    tomllib = None
+
+def resolve_user_path(raw):
+    value = str(raw or "").strip()
+    if value == "~":
+        return Path.home()
+    if value.startswith("~/") or value.startswith("~\\"):
+        return Path.home() / value[2:]
+    path = Path(value)
+    return path if path.is_absolute() else Path.cwd() / path
+
+def state_db_location(home, config_text):
+    configured = None
+    if tomllib is not None:
+        try:
+            configured = tomllib.loads(config_text).get("sqlite_home")
+        except Exception as exc:
+            raise RuntimeError("invalid config.toml; cannot resolve sqlite_home") from exc
+    else:
+        match = re.search(r'(?m)^sqlite_home\s*=\s*"([^"]+)"\s*$', config_text)
+        configured = match.group(1) if match else None
+    if configured is not None:
+        if not isinstance(configured, str) or not configured.strip():
+            raise RuntimeError("sqlite_home must be a non-empty string")
+        directory = resolve_user_path(configured)
+        source = "config.sqlite_home"
+    else:
+        environment = os.environ.get("CODEX_SQLITE_HOME", "").strip()
+        if environment:
+            directory = resolve_user_path(environment)
+            source = "env.CODEX_SQLITE_HOME"
+        else:
+            directory = home
+            source = "codex_home"
+    return (directory.resolve() / "state_5.sqlite").resolve(), source
 
 payload = globals().get("_guardian_payload")
 if payload is None:
     payload = json.load(__import__("sys").stdin)
 time.sleep(1.2)
 home = Path.home() / ".codex"
-db = home / "state_5.sqlite"
+config_text = (home / "config.toml").read_text(encoding="utf-8-sig")
+db, database_source = state_db_location(home, config_text)
 expected_archives = {str(key): int(value) for key, value in (payload.get("archives") or {}).items()}
 expected_paths = {str(key): str(value) for key, value in (payload.get("paths") or {}).items()}
 target = str(payload.get("target") or "")
@@ -1027,7 +1185,7 @@ if index.is_file():
     index_hash = hashlib.sha256(raw).hexdigest()
 if index_hash != payload.get("index_sha256"):
     raise RuntimeError("post-sync session_index changed")
-print(json.dumps({"ok": True, "post_restart_verified": True, "thread_count": len(rows), "active_count": sum(1 for value in actual_archives.values() if not value), "archived_count": sum(actual_archives.values()), "index_sha256": index_hash}, ensure_ascii=False))
+print(json.dumps({"ok": True, "post_restart_verified": True, "thread_count": len(rows), "active_count": sum(1 for value in actual_archives.values() if not value), "archived_count": sum(actual_archives.values()), "index_sha256": index_hash, "database_path": str(db), "database_source": database_source}, ensure_ascii=False))
 '''
 
 

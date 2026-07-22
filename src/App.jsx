@@ -750,6 +750,13 @@ function ClaudeProviderModal({ profile, onClose, onSaved, notify }) {
 function Protection({ status, onRepair, busy }) {
   const database = status?.database || {};
   const providerEntries = Object.entries(database.providers || {});
+  const databaseSource = database.source === "config.sqlite_home"
+    ? "config.toml · sqlite_home"
+    : database.source === "env.CODEX_SQLITE_HOME"
+      ? "环境变量 · CODEX_SQLITE_HOME"
+      : database.source === "codex_home"
+        ? "Codex 默认目录"
+        : "尚未定位";
   return (
     <div className="page-stack">
       <HealthStrip status={status} />
@@ -763,6 +770,10 @@ function Protection({ status, onRepair, busy }) {
             <div><span>总会话</span><strong>{database.total || 0}</strong></div>
             <div><span>活动</span><strong>{database.active || 0}</strong></div>
             <div><span>归档</span><strong>{database.archived || 0}</strong></div>
+          </div>
+          <div className="database-location">
+            <span>Codex 实际读取库 · {databaseSource}</span>
+            <code title={database.path || database.resolution_error || ""}>{database.path || database.resolution_error || "未找到 state_5.sqlite"}</code>
           </div>
         </section>
         <section className="content-panel protection-card">
@@ -782,11 +793,11 @@ function Protection({ status, onRepair, busy }) {
         <div className="repair-copy">
           <span className="eyebrow">共享历史修复</span>
           <h2>保持聊天列表固定，只切换账号线路</h2>
-          <p>关闭 Codex 后，把全部既有会话安全关联到当前官号或 API。聊天正文、顺序和归档状态不变，切换后仍显示同一套完整记录。</p>
+          <p>关闭 Codex 后，只在上方显示的实际 SQLite 中统一会话 provider 标签。聊天正文、顺序和归档状态不变；完成后请分别切换官方账号与 API 复核列表。</p>
           <div className="safety-checks">
-            <span><CheckCircle weight="fill" /> 所有账号显示同一套完整聊天记录</span>
+            <span><CheckCircle weight="fill" /> 自动识别 sqlite_home / CODEX_SQLITE_HOME</span>
             <span><CheckCircle weight="fill" /> 保持 archived 标记</span>
-            <span><CheckCircle weight="fill" /> 自动关闭并重新打开 Codex</span>
+            <span><CheckCircle weight="fill" /> 不修改旧的非活动 SQLite</span>
           </div>
         </div>
         <Button tone="primary" icon={ArrowClockwise} loading={busy} onClick={onRepair} disabled={busy}>修复共享历史</Button>
@@ -1375,7 +1386,7 @@ export function App() {
         onDelete={(profile) => setConfirmAction({ type: "delete", profile })}
       />
     );
-    if (route === "protection") return <Protection status={status} busy={busy} onRepair={() => run(() => api("/api/protection/repair", { method: "POST", body: "{}" }), "共享聊天历史已修复")} />;
+    if (route === "protection") return <Protection status={status} busy={busy} onRepair={() => run(() => api("/api/protection/repair", { method: "POST", body: "{}" }), "实际聊天库标签已修复，请切换账号复核")} />;
     if (route === "failover") return <FailoverPage client={failoverApiClient} onNavigateAccounts={() => setRoute("accounts")} />;
     if (route === "claude") return (
       <ClaudeDesktopPage

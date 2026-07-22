@@ -6,6 +6,7 @@ import hashlib
 import io
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -200,6 +201,114 @@ class GuardianServiceTests(unittest.TestCase):
             self.assertFalse((profile_root / "archived_sessions").exists())
             self.assertFalse((profile_root / "state_5.sqlite").exists())
             self.assertFalse((profile_root / "session_index.jsonl").exists())
+
+    def test_config_sqlite_home_takes_precedence_and_only_actual_database_changes(self) -> None:
+        root = self.codex.parent
+        config_sqlite_home = root / "config-sqlite-home"
+        environment_sqlite_home = root / "environment-sqlite-home"
+        config_sqlite_home.mkdir()
+        environment_sqlite_home.mkdir()
+        default_db = self.codex / "state_5.sqlite"
+        config_db = config_sqlite_home / "state_5.sqlite"
+        environment_db = environment_sqlite_home / "state_5.sqlite"
+        shutil.copy2(default_db, config_db)
+        shutil.copy2(default_db, environment_db)
+        (self.codex / "config.toml").write_text(
+            'model = "gpt-5.5"\nmodel_provider = "openai"\n'
+            f'sqlite_home = "{config_sqlite_home.as_posix()}"\n',
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"CODEX_SQLITE_HOME": str(environment_sqlite_home)}):
+            result = self.service._migrate_thread_provider("guardian_shared")
+
+        self.assertEqual(result["database_source"], "config.sqlite_home")
+        self.assertEqual(Path(result["database_path"]), config_db.resolve())
+        for path, expected in (
+            (config_db, {"guardian_shared"}),
+            (environment_db, {"openai"}),
+            (default_db, {"openai"}),
+        ):
+            connection = sqlite3.connect(path)
+            providers = {row[0] for row in connection.execute("SELECT model_provider FROM threads")}
+            connection.close()
+            self.assertEqual(providers, expected)
+
+    def test_codex_sqlite_home_environment_is_used_without_config_override(self) -> None:
+        sqlite_home = self.codex.parent / "environment-sqlite-home"
+        sqlite_home.mkdir()
+        actual_db = sqlite_home / "state_5.sqlite"
+        default_db = self.codex / "state_5.sqlite"
+        shutil.copy2(default_db, actual_db)
+
+        with patch.dict(os.environ, {"CODEX_SQLITE_HOME": str(sqlite_home)}):
+            result = self.service._migrate_thread_provider("guardian_environment")
+            status = self.service._database_status()
+
+        self.assertEqual(result["database_source"], "env.CODEX_SQLITE_HOME")
+        self.assertEqual(Path(result["database_path"]), actual_db.resolve())
+        self.assertEqual(status["source"], "env.CODEX_SQLITE_HOME")
+        self.assertEqual(Path(status["path"]), actual_db.resolve())
+        connection = sqlite3.connect(default_db)
+        self.assertEqual(
+            {row[0] for row in connection.execute("SELECT model_provider FROM threads")},
+            {"openai"},
+        )
+        connection.close()
+
+    def test_relative_sqlite_home_resolves_from_current_working_directory(self) -> None:
+        working = self.codex.parent / "working"
+        actual_home = working / "relative-state"
+        actual_home.mkdir(parents=True)
+        shutil.copy2(self.codex / "state_5.sqlite", actual_home / "state_5.sqlite")
+        (self.codex / "config.toml").write_text(
+            'model_provider = "openai"\nsqlite_home = "relative-state"\n',
+            encoding="utf-8",
+        )
+        previous = Path.cwd()
+        try:
+            os.chdir(working)
+            location = self.service._state_database_location()
+        finally:
+            os.chdir(previous)
+        self.assertEqual(location["source"], "config.sqlite_home")
+        self.assertEqual(Path(location["path"]), (actual_home / "state_5.sqlite").resolve())
+
+    def test_backup_and_restore_follow_recorded_sqlite_override(self) -> None:
+        sqlite_home = self.codex.parent / "config-sqlite-home"
+        sqlite_home.mkdir()
+        actual_db = sqlite_home / "state_5.sqlite"
+        default_db = self.codex / "state_5.sqlite"
+        shutil.copy2(default_db, actual_db)
+        (self.codex / "config.toml").write_text(
+            'model_provider = "openai"\n'
+            f'sqlite_home = "{sqlite_home.as_posix()}"\n',
+            encoding="utf-8",
+        )
+        backup = self.service.create_backup("sqlite-override", prune=False)
+        backup_root = self.data / "backups" / backup["name"]
+        manifest = json.loads((backup_root / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["state_database"]["source"], "config.sqlite_home")
+        self.assertEqual(Path(manifest["state_database"]["path"]), actual_db.resolve())
+
+        connection = sqlite3.connect(actual_db)
+        connection.execute("UPDATE threads SET model_provider='broken-provider'")
+        connection.commit()
+        connection.close()
+        self.service._restore_files_from_backup(backup_root)
+
+        connection = sqlite3.connect(actual_db)
+        actual_providers = {
+            row[0] for row in connection.execute("SELECT model_provider FROM threads")
+        }
+        connection.close()
+        connection = sqlite3.connect(default_db)
+        default_providers = {
+            row[0] for row in connection.execute("SELECT model_provider FROM threads")
+        }
+        connection.close()
+        self.assertEqual(actual_providers, {"openai"})
+        self.assertEqual(default_providers, {"openai"})
 
     def test_switch_repairs_prior_half_switch_for_active_threads(self) -> None:
         official = self.service.capture_official("Fixture Official")
@@ -1245,6 +1354,83 @@ for line in sys.stdin:
             db.close()
             self.assertEqual(sorted(rows), [("guardian_fixture", 0), ("guardian_fixture", 1)])
             self.assertFalse((codex / "session_index.jsonl").exists())
+
+    def test_remote_reconcile_uses_config_sqlite_home_instead_of_stale_default_db(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex = root / ".codex"
+            sessions = codex / "sessions"
+            archive = codex / "archived_sessions"
+            sqlite_home = root / "actual-sqlite"
+            environment_sqlite_home = root / "environment-sqlite"
+            sessions.mkdir(parents=True)
+            archive.mkdir(parents=True)
+            sqlite_home.mkdir()
+            environment_sqlite_home.mkdir()
+            thread_id = "019f40ce-dc00-7000-9000-000000000301"
+            rollout = sessions / f"rollout-{thread_id}.jsonl"
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {"id": thread_id, "model_provider": "openai"},
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (codex / "config.toml").write_text(
+                'model_provider = "guardian_fixture"\n'
+                f'sqlite_home = "{sqlite_home.as_posix()}"\n',
+                encoding="utf-8",
+            )
+
+            def create_database(path: Path) -> None:
+                connection = sqlite3.connect(path)
+                connection.execute(
+                    "CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER, "
+                    "rollout_path TEXT, model_provider TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO threads VALUES (?,?,?,?)",
+                    (thread_id, 0, str(rollout), "openai"),
+                )
+                connection.commit()
+                connection.close()
+
+            default_db = codex / "state_5.sqlite"
+            actual_db = sqlite_home / "state_5.sqlite"
+            environment_db = environment_sqlite_home / "state_5.sqlite"
+            create_database(default_db)
+            create_database(actual_db)
+            create_database(environment_db)
+            env = os.environ.copy()
+            env["HOME"] = str(root)
+            env["USERPROFILE"] = str(root)
+            env["CODEX_SQLITE_HOME"] = str(environment_sqlite_home)
+            completed = subprocess.run(
+                [sys.executable, "-c", _REMOTE_RECONCILE_SCRIPT],
+                cwd=str(root),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=20,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads(completed.stdout)
+            self.assertEqual(result["database_source"], "config.sqlite_home")
+            self.assertEqual(Path(result["database_path"]), actual_db.resolve())
+            for path, expected in (
+                (actual_db, "guardian_fixture"),
+                (environment_db, "openai"),
+                (default_db, "openai"),
+            ):
+                connection = sqlite3.connect(path)
+                provider = connection.execute("SELECT model_provider FROM threads").fetchone()[0]
+                connection.close()
+                self.assertEqual(provider, expected)
 
     def test_remote_reconcile_quarantines_prefix_duplicate_without_changing_archive(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

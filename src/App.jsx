@@ -2,17 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Archive,
   ArrowClockwise,
-  ArrowRight,
   ArrowsSplit,
-  CaretRight,
-  ChatsCircle,
   CheckCircle,
   CircleNotch,
   Cloud,
   Database,
   Desktop,
   DownloadSimple,
-  Eye,
   FolderOpen,
   Gauge,
   GearSix,
@@ -39,7 +35,7 @@ import { FailoverPage } from "./failover/FailoverPage.jsx";
 import { GuardianMark } from "./GuardianMark.jsx";
 
 const navItems = [
-  { id: "overview", label: "概览", icon: Gauge },
+  { id: "overview", label: "主页", icon: Gauge },
   { id: "accounts", label: "账号", icon: UserSwitch },
   { id: "protection", label: "聊天保护", icon: ShieldCheck },
   { id: "failover", label: "API 容灾", icon: ArrowsSplit },
@@ -49,7 +45,7 @@ const navItems = [
 ];
 
 const pageCopy = {
-  overview: ["概览", "账号、会话与安全状态一眼看清"],
+  overview: ["主页", "查看全部官方账号额度与同步状态"],
   accounts: ["账号", "管理官方登录与第三方 API"],
   protection: ["聊天保护", "核对同一本地会话库、provider 标签与归档状态"],
   failover: ["API 容灾", "当前线路、故障原因与下一步"],
@@ -197,7 +193,7 @@ function OfficialQuota({ profile, showPlan = true }) {
       ) : (
         <div className="quota-empty-copy">
           <Gauge weight="duotone" />
-          <span>额度暂未同步</span>
+          <span>{quota?.error || "额度暂未同步"}</span>
         </div>
       )}
     </div>
@@ -293,19 +289,6 @@ function EmptyState({ icon: Icon = Database, title, detail, action }) {
   );
 }
 
-function StatCard({ label, value, detail, icon: Icon, tone = "blue" }) {
-  return (
-    <article className="stat-card">
-      <div className={`stat-icon tone-${tone}`}><Icon weight="duotone" /></div>
-      <div>
-        <span>{label}</span>
-        <strong>{value}</strong>
-        <small>{detail}</small>
-      </div>
-    </article>
-  );
-}
-
 function HealthStrip({ status }) {
   const safe = status?.health?.safe;
   const db = status?.database || {};
@@ -388,98 +371,61 @@ function ProfileCard({ profile, onSwitch, onSync, onTest, onEdit, onDelete, busy
         <button className="icon-button" onClick={() => onEdit(profile)} disabled={busy} aria-label="编辑">
           <PencilSimple weight="bold" />
         </button>
-        <button className="icon-button danger" onClick={() => onDelete(profile)} disabled={busy || profile.current} aria-label="删除">
-          <Trash weight="bold" />
-        </button>
+        {!profile.current && (
+          <button className="icon-button danger" onClick={() => onDelete(profile)} disabled={busy} aria-label="删除">
+            <Trash weight="bold" />
+          </button>
+        )}
       </footer>
     </article>
   );
 }
 
-function Overview({ status, onNavigate, onSwitch, onOpenAdd, onRefreshQuota, quotaRefreshing, busy }) {
-  const profiles = status?.profiles || [];
-  const current = status?.current_profile;
-  const quotaProfile = current?.type === "official"
-    ? current
-    : profiles.find((profile) => profile.type === "official");
-  const quota = quotaForProfile(quotaProfile);
-  const weekly = weeklyQuotaWindow(quota);
-  const resetCards = quota?.reset_cards ?? quota?.resetCards;
+function Overview({ status, onOpenAdd, onRefreshQuota, quotaRefreshing }) {
+  const officialProfiles = (status?.profiles || []).filter((profile) => profile.type === "official");
+  const latestSync = officialProfiles
+    .map((profile) => quotaForProfile(profile)?.fetched_at)
+    .filter(Boolean)
+    .sort()
+    .at(-1);
   return (
     <div className="page-stack">
-      <div className="stats-grid">
-        <StatCard label="账号总数" value={profiles.length} detail="官方账号与第三方 API" icon={UserSwitch} />
-        <StatCard label="当前连接" value={current ? current.name : "未设置"} detail={status?.config_provider || "openai"} icon={PlugsConnected} tone="cyan" />
-        <StatCard label="活动会话" value={status?.database?.active || 0} detail="左侧列表可见" icon={ChatsCircle} tone="green" />
-        <StatCard label="归档会话" value={status?.database?.archived || 0} detail="保持原归档状态" icon={Archive} tone="amber" />
-      </div>
-      {quotaProfile && (
-        <section className="overview-quota-panel">
-          <div className="overview-quota-account quota-summary-card">
-            <div className="overview-quota-icon"><Gauge weight="duotone" /></div>
-            <div>
-              <span>官方账号额度</span>
-              <strong>{quotaProfile.name}</strong>
-              <small>{quotaProfile.current ? "当前账号" : "首个官方账号"}</small>
-            </div>
-            <Badge tone="blue">{quotaPlanLabel(quotaProfile)}</Badge>
-          </div>
-          <QuotaMeter label="每周" windowData={weekly} />
-          <ResetCardBalance data={resetCards} />
-          <div className="overview-quota-footer">
-            <span>{quota?.fetched_at ? `自动同步于 ${formatDate(quota.fetched_at)}` : "额度尚未同步"}</span>
-            <Button icon={ArrowClockwise} onClick={onRefreshQuota} loading={quotaRefreshing} disabled={quotaRefreshing}>手动同步额度</Button>
-          </div>
-        </section>
-      )}
-      <HealthStrip status={status} />
-      <section className="content-panel">
-        <header className="panel-heading">
+      <section className="home-quota-panel">
+        <header className="home-quota-heading">
           <div>
-            <span className="eyebrow">快速切换</span>
-            <h2>选择一个账号继续</h2>
+            <span className="eyebrow">账号额度</span>
+            <h2>全部官方账号</h2>
+            <p>{officialProfiles.length ? `${officialProfiles.length} 个账号 · 前台每 60 秒自动同步，切回窗口立即刷新` : "绑定官方账号后，这里会集中显示每个账号的额度"}</p>
           </div>
-          <div className="panel-actions">
-            <Button icon={Plus} tone="primary" onClick={onOpenAdd}>添加账号</Button>
-            <Button icon={ArrowRight} onClick={() => onNavigate("accounts")}>全部账号</Button>
+          <div className="home-quota-actions">
+            <span>{latestSync ? `最近同步于 ${formatDate(latestSync)}` : "额度尚未同步"}</span>
+            <Button icon={ArrowClockwise} onClick={onRefreshQuota} loading={quotaRefreshing} disabled={quotaRefreshing || !officialProfiles.length}>同步全部额度</Button>
           </div>
         </header>
-        {profiles.length ? (
-          <div className="quick-profile-grid">
-            {profiles.slice(0, 4).map((profile) => (
-              <button
-                key={profile.id}
-                className={`quick-profile ${profile.current ? "is-current" : ""}`}
-                onClick={() => !profile.current && onSwitch(profile)}
-                disabled={busy || profile.current}
-              >
-                <span className={`mini-provider ${profile.type}`}>
-                  {profile.type === "official" ? <Cloud weight="duotone" /> : <Key weight="duotone" />}
-                </span>
-                <span className="quick-profile-copy">
-                  <strong>{profile.name}</strong>
-                  <small>{modelLabel(profile)}</small>
-                </span>
-                {profile.current ? <Badge tone="success">当前</Badge> : <CaretRight weight="bold" />}
-              </button>
+        {officialProfiles.length ? (
+          <div className="home-quota-grid">
+            {officialProfiles.map((profile) => (
+              <article className={`home-quota-card ${profile.current ? "is-current" : ""}`} key={profile.id}>
+                <header className="home-quota-account">
+                  <div className="home-quota-icon"><Gauge weight="duotone" /></div>
+                  <div>
+                    <strong>{profile.name}</strong>
+                    <span>{profile.current ? "当前使用账号" : "已绑定官方账号"}</span>
+                  </div>
+                  <Badge tone="blue">{quotaPlanLabel(profile)}</Badge>
+                </header>
+                <OfficialQuota profile={profile} showPlan={false} />
+              </article>
             ))}
           </div>
         ) : (
           <EmptyState
-            icon={UserSwitch}
-            title="还没有账号"
-            detail="可导入 Cockpit Tools 中的官方账号，或添加第三方 API。"
-            action={<Button tone="primary" icon={Plus} onClick={onOpenAdd}>添加第一个账号</Button>}
+            icon={Gauge}
+            title="还没有可显示的账号额度"
+            detail="使用 ChatGPT OAuth 绑定官方账号，不需要先切换 Codex 当前登录。"
+            action={<Button tone="primary" icon={Plus} onClick={onOpenAdd}>绑定官方账号</Button>}
           />
         )}
-      </section>
-      <section className="timeline-panel">
-        <div className="timeline-mark"><Database weight="duotone" /></div>
-        <div>
-          <strong>统一会话库</strong>
-          <p>所有账号继续使用同一个 <code>{status?.codex_home || "~/.codex"}</code>。切换时只把会话关联到当前请求线路，不搬走或删除聊天正文。</p>
-        </div>
-        <Button tone="neutral" icon={Eye} onClick={() => onNavigate("protection")}>查看保护状态</Button>
       </section>
     </div>
   );
@@ -1009,8 +955,8 @@ function AddProfileModal({ onClose, onCreated, notify }) {
     setLoading(true);
     try {
       if (type === "official") {
-        await api("/api/profiles/official/capture", { method: "POST", body: JSON.stringify(official) });
-        notify("已加密保存当前官方登录", "success");
+        await api("/api/profiles/official/oauth", { method: "POST", body: JSON.stringify(official) });
+        notify("OAuth 绑定成功，账号凭据已加密保存", "success");
       } else {
         await api("/api/profiles/api", { method: "POST", body: JSON.stringify(thirdParty) });
         notify("第三方 API 已保存", "success");
@@ -1032,7 +978,7 @@ function AddProfileModal({ onClose, onCreated, notify }) {
       <form className="modal-form" onSubmit={submit}>
         {type === "official" ? (
           <>
-            <div className="info-callout"><LockKey weight="duotone" /><div><strong>保存当前登录</strong><p>读取现有 <code>auth.json</code>，加密后保存。不会显示或上传 Token。</p></div></div>
+            <div className="info-callout"><LockKey weight="duotone" /><div><strong>使用 ChatGPT OAuth 绑定</strong><p>点击后会打开官方登录网页。登录在一次性隔离目录中完成，不会改变 Codex 当前账号、配置或聊天记录。</p></div></div>
             <label><span>账号名称</span><input required value={official.name} onChange={(event) => setOfficial({ ...official, name: event.target.value })} placeholder="例如：个人 Plus" /></label>
             <label>
               <span>默认模型（可选）</span>
@@ -1052,7 +998,12 @@ function AddProfileModal({ onClose, onCreated, notify }) {
             </label>
           </>
         )}
-        <footer className="modal-footer"><Button type="button" onClick={onClose}>取消</Button><Button type="submit" tone="primary" icon={Plus} loading={loading} disabled={loading}>保存账号</Button></footer>
+        <footer className="modal-footer">
+          <Button type="button" onClick={onClose}>取消</Button>
+          <Button type="submit" tone="primary" icon={type === "official" ? Cloud : Plus} loading={loading} disabled={loading}>
+            {type === "official" ? "打开官方登录并绑定" : "保存账号"}
+          </Button>
+        </footer>
       </form>
     </Modal>
   );
@@ -1428,7 +1379,7 @@ export function App() {
       busy,
       onSwitch: (profile) => setConfirmAction({ type: "switch", profile }),
     };
-    if (route === "overview") return <Overview {...shared} onNavigate={setRoute} onOpenAdd={() => setAddOpen(true)} onRefreshQuota={refreshQuotaNow} quotaRefreshing={refreshing} />;
+    if (route === "overview") return <Overview status={status} onOpenAdd={() => setAddOpen(true)} onRefreshQuota={refreshQuotaNow} quotaRefreshing={refreshing} />;
     if (route === "accounts") return (
       <Accounts
         {...shared}

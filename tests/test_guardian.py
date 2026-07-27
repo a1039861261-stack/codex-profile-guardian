@@ -1155,6 +1155,42 @@ for line in sys.stdin:
         self.assertEqual(len(self.service.list_profiles()), 1)
         self.assertIn(b"refresh-a-new", self.service.decrypt_secret(first["id"]))
 
+    def test_oauth_binding_uses_isolated_home_and_keeps_current_login_unchanged(self) -> None:
+        current = self.service.capture_official("Current account")
+        live_auth = (self.codex / "auth.json").read_bytes()
+        observed: dict[str, object] = {}
+
+        def complete_oauth(command, **kwargs):
+            isolated_home = Path(kwargs["env"]["CODEX_HOME"])
+            observed["command"] = command
+            observed["home"] = isolated_home
+            observed["config"] = (isolated_home / "config.toml").read_text(encoding="utf-8")
+            (isolated_home / "auth.json").write_text(
+                auth_payload("account-oauth", "refresh-oauth"),
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(command, 0)
+
+        with (
+            patch.object(self.service, "_codex_cli_command", return_value=["codex-fixture", "login"]),
+            patch("backend.guardian.subprocess.run", side_effect=complete_oauth),
+        ):
+            bound = self.service.bind_official_oauth("Browser account")
+
+        self.assertEqual(observed["command"], ["codex-fixture", "login"])
+        self.assertNotEqual(observed["home"], self.codex)
+        self.assertEqual(observed["config"], 'cli_auth_credentials_store = "file"\n')
+        self.assertEqual((self.codex / "auth.json").read_bytes(), live_auth)
+        self.assertEqual(self.service.status()["current_profile"]["id"], current["id"])
+        self.assertIn(b"refresh-oauth", self.service.decrypt_secret(bound["id"]))
+        self.assertEqual(
+            next(item for item in self.service.list_profiles() if item["id"] == bound["id"])[
+                "credential_source"
+            ],
+            "guardian_oauth",
+        )
+        self.assertEqual(list(self.data.glob("oauth-*")), [])
+
     def test_switch_saves_rotated_live_token_before_overwrite(self) -> None:
         account_a = self.service.capture_official("Account A")
         (self.codex / "auth.json").write_text(auth_payload("account-b", "refresh-b"), encoding="utf-8")

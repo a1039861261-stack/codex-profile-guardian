@@ -177,6 +177,30 @@ class GuardianManagementHttpTests(unittest.TestCase):
         self.assertEqual(headers.get("access-control-allow-origin"), origin)
         self.assertEqual(headers.get("access-control-allow-credentials"), "true")
 
+    def test_official_oauth_binding_requires_session_and_calls_isolated_flow(self) -> None:
+        status, _, payload = self._request(
+            "POST",
+            "/api/profiles/official/oauth",
+            payload={"name": "Browser account", "model": ""},
+        )
+        self.assertEqual(
+            (status, payload["error"]["code"]),
+            (401, "guardian_management_session_required"),
+        )
+
+        cookie = self._session()
+        expected = {"id": "official-oauth", "name": "Browser account", "type": "official"}
+        with patch.object(self.service, "bind_official_oauth", return_value=expected) as bind:
+            status, _, payload = self._request(
+                "POST",
+                "/api/profiles/official/oauth",
+                cookie=cookie,
+                payload={"name": "Browser account", "model": "gpt-fixture"},
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"], expected)
+        bind.assert_called_once_with("Browser account", "gpt-fixture")
+
     def test_failover_http_crud_publish_retest_delete_and_revision_conflict(self) -> None:
         cookie = self._session()
         status, _, payload = self._request("GET", "/api/failover/overview", cookie=cookie)

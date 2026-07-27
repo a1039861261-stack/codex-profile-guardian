@@ -81,7 +81,7 @@ def main() -> int:
     first = service.capture_official("个人 Plus", "gpt-5.5")
     (codex / "auth.json").write_text(auth_payload("official-b", "refresh-b"), encoding="utf-8")
     service.capture_official("工作账号", "gpt-5.4")
-    service.create_api_profile("APIKEY.FUN", "http://192.168.5.24:8317/v1", "fixture-api-key", "gpt-5.4")
+    service.create_api_profile("APIKEY.FUN", "https://api.example.invalid/v1", "fixture-api-key", "gpt-5.4")
     state = service._load_state()
     state["current_profile"] = first["id"]
     for profile in state["profiles"]:

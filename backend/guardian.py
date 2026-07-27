@@ -48,7 +48,7 @@ from gateway.protocols.responses import normalize_protocol_compatibility
 
 
 APP_NAME = "Codex Profile Guardian"
-APP_VERSION = "1.9.3"
+APP_VERSION = "1.10.0"
 SCHEMA_VERSION = 1
 MANAGED_START = "# BEGIN CODEX PROFILE GUARDIAN MANAGED"
 MANAGED_END = "# END CODEX PROFILE GUARDIAN MANAGED"
@@ -403,6 +403,7 @@ class GuardianService:
         self.helper_command = helper_command or self._default_helper_command()
         self.lock = threading.RLock()
         self.quota_refresh_lock = threading.Lock()
+        self.oauth_login_lock = threading.Lock()
         self.is_fixture = self.codex_home != default_codex_home.expanduser().resolve()
         self.claude_desktop = ClaudeDesktopIntegration(
             local_appdata=claude_local_appdata,
@@ -1091,13 +1092,13 @@ class GuardianService:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def _codex_app_server_command(self) -> list[str]:
+    def _codex_cli_command(self, *arguments: str) -> list[str]:
         override = os.environ.get("CODEX_GUARDIAN_CLI", "").strip()
         if override:
             executable = Path(override).expanduser().resolve()
             if not executable.is_file():
                 raise GuardianError("指定的 Codex CLI 不存在。")
-            return [str(executable), "app-server", "--stdio"]
+            return [str(executable), *arguments]
 
         if os.name == "nt":
             appdata = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
@@ -1111,7 +1112,7 @@ class GuardianService:
                 )
             for executable in native_candidates:
                 if executable.is_file():
-                    return [str(executable), "app-server", "--stdio"]
+                    return [str(executable), *arguments]
 
         command = shutil.which("codex") or shutil.which("codex.cmd")
         if command and not (
@@ -1122,7 +1123,7 @@ class GuardianService:
                 and "\\windowsapps\\openai.codex_" in str(Path(command)).lower()
             )
             if not is_store_resource:
-                return [command, "app-server", "--stdio"]
+                return [command, *arguments]
             try:
                 probe = subprocess.run(
                     [command, "--version"],
@@ -1132,7 +1133,7 @@ class GuardianService:
                     creationflags=0x08000000,
                 )
                 if probe.returncode == 0:
-                    return [command, "app-server", "--stdio"]
+                    return [command, *arguments]
             except (OSError, subprocess.SubprocessError):
                 command = None
 
@@ -1145,21 +1146,24 @@ class GuardianService:
                     custom_package / "node_modules" / "@openai" / package_name
                 ).glob("vendor/*/bin/codex.exe"):
                     if executable.is_file():
-                        return [str(executable), "app-server", "--stdio"]
+                        return [str(executable), *arguments]
 
         # Windows Store ACLs allow reading the packaged CLI but can deny direct
         # execution from WindowsApps. Cache that exact version in Guardian's
         # user-writable runtime directory before starting app-server.
         packaged = self._cached_windows_store_codex_cli()
         if packaged is not None:
-            return [str(packaged), "app-server", "--stdio"]
+            return [str(packaged), *arguments]
 
         if command and os.name == "nt":
-            invocation = subprocess.list2cmdline([command, "app-server", "--stdio"])
+            invocation = subprocess.list2cmdline([command, *arguments])
             return ["cmd.exe", "/d", "/s", "/c", invocation]
         if command:
-            return [command, "app-server", "--stdio"]
-        raise GuardianError("未找到 Codex CLI，无法读取官方账号额度。")
+            return [command, *arguments]
+        raise GuardianError("未找到 Codex CLI，无法完成官方登录或读取账号额度。")
+
+    def _codex_app_server_command(self) -> list[str]:
+        return self._codex_cli_command("app-server", "--stdio")
 
     def _query_official_quota(
         self, profile: dict[str, Any]
@@ -1512,12 +1516,16 @@ class GuardianService:
         )
         return str(profile["id"])
 
-    def capture_official(self, name: str, model: str = "") -> dict[str, Any]:
+    def _save_official_profile_from_auth(
+        self,
+        name: str,
+        model: str,
+        auth_bytes: bytes,
+        *,
+        source: str,
+        make_current: bool,
+    ) -> dict[str, Any]:
         with self.lock:
-            auth_path = self.codex_home / "auth.json"
-            if not auth_path.is_file():
-                raise GuardianError("未找到当前官方登录。请先在 Codex 完成官方账号登录。")
-            auth_bytes = auth_path.read_bytes()
             metadata = official_auth_metadata(auth_bytes)
             name = (name or "官方账号").strip()[:80]
             model = (model or "").strip()[:120]
@@ -1528,9 +1536,10 @@ class GuardianService:
             if existing:
                 existing["name"] = name
                 existing["model"] = model
-                state["current_profile"] = existing["id"]
+                if make_current:
+                    state["current_profile"] = existing["id"]
                 self._save_official_auth(
-                    state, existing, auth_bytes, metadata, source="current_auth"
+                    state, existing, auth_bytes, metadata, source=source
                 )
                 self._log(
                     "profile.capture",
@@ -1552,18 +1561,19 @@ class GuardianService:
                 "provider_id": "openai",
                 "model": model,
                 "plan": "ChatGPT",
-                "source": "current_auth",
+                "source": source,
                 "secret_file": secret_file,
                 "account_fingerprint": metadata["account_fingerprint"],
                 "credential_updated_at": utc_now(),
                 "credential_last_refresh": metadata.get("last_refresh") or None,
-                "credential_source": "current_auth",
+                "credential_source": source,
                 "requires_reauth": False,
                 "created_at": utc_now(),
                 "last_used_at": None,
             }
             state["profiles"].append(profile)
-            state["current_profile"] = profile_id
+            if make_current:
+                state["current_profile"] = profile_id
             self._save_state(state)
             self._log("profile.capture", "success", f"已保存官方账号：{name}", profile_id=profile_id)
             return {
@@ -1571,6 +1581,68 @@ class GuardianService:
                 for key, value in profile.items()
                 if key not in {"secret_file", "config_secret_file", "account_fingerprint"}
             }
+
+    def capture_official(self, name: str, model: str = "") -> dict[str, Any]:
+        auth_path = self.codex_home / "auth.json"
+        if not auth_path.is_file():
+            raise GuardianError("未找到当前官方登录。请先在 Codex 完成官方账号登录。")
+        return self._save_official_profile_from_auth(
+            name,
+            model,
+            auth_path.read_bytes(),
+            source="current_auth",
+            make_current=True,
+        )
+
+    def bind_official_oauth(self, name: str, model: str = "") -> dict[str, Any]:
+        if not self.oauth_login_lock.acquire(blocking=False):
+            raise GuardianError("已有一个官方账号正在绑定，请先完成浏览器中的登录。")
+        try:
+            with tempfile.TemporaryDirectory(prefix="oauth-", dir=self.data_dir) as temporary:
+                isolated_home = Path(temporary).resolve()
+                atomic_write(
+                    isolated_home / "config.toml",
+                    b'cli_auth_credentials_store = "file"\n',
+                )
+                environment = os.environ.copy()
+                environment["CODEX_HOME"] = str(isolated_home)
+                command = self._codex_cli_command("login")
+                try:
+                    result = subprocess.run(
+                        command,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        cwd=str(isolated_home),
+                        env=environment,
+                        timeout=600,
+                        creationflags=0x08000000 if os.name == "nt" else 0,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise GuardianError("官方登录已超时，请重新发起绑定。") from exc
+                except OSError as exc:
+                    raise GuardianError("无法启动官方 Codex 登录。") from exc
+                if result.returncode != 0:
+                    raise GuardianError("官方登录未完成，未保存任何账号。")
+                auth_path = isolated_home / "auth.json"
+                if not auth_path.is_file():
+                    raise GuardianError("官方登录未返回可保存的账号凭据。")
+                profile = self._save_official_profile_from_auth(
+                    name,
+                    model,
+                    auth_path.read_bytes(),
+                    source="guardian_oauth",
+                    make_current=False,
+                )
+                self._log(
+                    "profile.oauth_bind",
+                    "success",
+                    f"已通过官方 OAuth 绑定账号：{profile['name']}",
+                    profile_id=profile["id"],
+                )
+                return profile
+        finally:
+            self.oauth_login_lock.release()
 
     def import_cockpit(self) -> dict[str, Any]:
         with self.lock:

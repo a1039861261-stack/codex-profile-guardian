@@ -59,13 +59,45 @@ class UIReleaseContractTests(unittest.TestCase):
         self.assertIn("<ResetCardBalance data={resetCards} />", application)
         self.assertIn("window.setInterval(syncVisibleQuota, 60_000)", application)
 
-    def test_overview_quota_cards_are_unframed_aligned_and_manual(self) -> None:
+    def test_account_cards_hide_current_delete_and_pad_quota_content(self) -> None:
         application = (self.project / "src" / "App.jsx").read_text(encoding="utf-8")
         stylesheet = (self.project / "src" / "styles.css").read_text(encoding="utf-8")
-        self.assertIn('<section className="overview-quota-panel">', application)
-        self.assertNotIn('<section className="content-panel overview-quota-panel">', application)
-        self.assertIn("grid-template-columns: repeat(3, minmax(0, 1fr));", stylesheet)
-        self.assertIn("手动同步额度", application)
+        profile_card = application.split("function ProfileCard(", 1)[1].split(
+            "function Overview(", 1
+        )[0]
+        self.assertIn("!profile.current && (", profile_card)
+        self.assertIn(
+            'className="icon-button danger" onClick={() => onDelete(profile)} disabled={busy}',
+            profile_card,
+        )
+        self.assertIn(
+            ".profile-card .quota-summary-card { padding: 11px 12px; }",
+            stylesheet,
+        )
+
+    def test_home_is_quota_only_and_renders_every_official_account(self) -> None:
+        application = (self.project / "src" / "App.jsx").read_text(encoding="utf-8")
+        stylesheet = (self.project / "src" / "styles.css").read_text(encoding="utf-8")
+        overview = application.split("function Overview(", 1)[1].split(
+            "function Accounts(", 1
+        )[0]
+        self.assertIn('{ id: "overview", label: "主页"', application)
+        self.assertIn('overview: ["主页", "查看全部官方账号额度与同步状态"]', application)
+        self.assertIn('profile.type === "official"', overview)
+        self.assertIn("officialProfiles.map((profile)", overview)
+        self.assertIn('<OfficialQuota profile={profile} showPlan={false} />', overview)
+        self.assertIn("同步全部额度", overview)
+        self.assertNotIn("快速切换", overview)
+        self.assertNotIn("统一会话库", overview)
+        self.assertNotIn("<StatCard", overview)
+        self.assertNotIn("<HealthStrip", overview)
+        self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr));", stylesheet)
+
+    def test_official_account_modal_uses_isolated_chatgpt_oauth(self) -> None:
+        application = (self.project / "src" / "App.jsx").read_text(encoding="utf-8")
+        self.assertIn('api("/api/profiles/official/oauth"', application)
+        self.assertIn("使用 ChatGPT OAuth 绑定", application)
+        self.assertIn("不会改变 Codex 当前账号、配置或聊天记录", application)
         self.assertIn("手动检查更新", application)
 
     def test_verified_background_update_prompts_once_per_app_session(self) -> None:

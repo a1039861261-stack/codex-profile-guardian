@@ -16,7 +16,7 @@ import { GuardianMark } from "../GuardianMark.jsx";
 import "./preview.css";
 
 const navItems = [
-  [Gauge, "概览"],
+  [Gauge, "主页"],
   [Database, "账号"],
   [ShieldCheck, "聊天保护"],
   [ArrowsSplit, "API 容灾"],

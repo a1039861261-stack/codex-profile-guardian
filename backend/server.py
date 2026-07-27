@@ -303,6 +303,11 @@ class GuardianHandler(SimpleHTTPRequestHandler):
             failover = self.service.failover
             if path == "/api/profiles/official/capture":
                 data = self.service.capture_official(body.get("name", ""), body.get("model", ""))
+            elif path == "/api/profiles/official/oauth":
+                data = self.service.bind_official_oauth(
+                    body.get("name", ""),
+                    body.get("model", ""),
+                )
             elif path == "/api/profiles/api":
                 data = self.service.create_api_profile(
                     body.get("name", ""),

@@ -716,7 +716,9 @@ function Protection({
         ? "Codex 默认目录"
         : "尚未定位";
   const activeTurnCount = conflicts?.active_turns?.active_count || 0;
+  const interruptedTurnCount = conflicts?.active_turns?.interrupted_count || 0;
   const uncertainTurnCount = conflicts?.active_turns?.uncertain_count || 0;
+  const processState = conflicts?.active_turns?.process_state;
   const divergentCount = conflicts?.divergent_duplicate_id_count || 0;
   const conflictCopies = (conflicts?.conflicts || []).reduce(
     (total, item) => total + Number(item.copy_count || 0),
@@ -734,9 +736,16 @@ function Protection({
           {conflictLoading ? (
             <><h2>正在只读核对任务与聊天副本</h2><p>不会读取正文到界面，也不会修改会话文件。</p></>
           ) : activeTurnCount ? (
-            <><h2>检测到 {activeTurnCount} 个任务仍在执行</h2><p>Guardian 已禁止关闭 Codex 和账号切换。等当前回复完整结束后，再刷新检测。</p></>
+            <>
+              <h2>检测到 {activeTurnCount} 个任务仍在执行</h2>
+              <p>{processState === "running" ? "Codex 窗口即使已经关闭，后台 app-server 或 CLI 写入进程仍可能继续任务。Guardian 已停止切换，请等任务结束或确认后台进程退出后再刷新。" : "Guardian 已禁止关闭 Codex 和账号切换。等当前回复完整结束后，再刷新检测。"}</p>
+            </>
           ) : uncertainTurnCount ? (
-            <><h2>无法确认最近任务是否已经结束</h2><p>Guardian 已按安全规则停止切换。请等待界面停止输出并正常退出 Codex，再刷新检测。</p></>
+            processState === "unknown" ? (
+              <><h2>无法确认 Codex 后台进程状态</h2><p>Guardian 已按安全规则停止切换。请重试检测；查询恢复前不会关闭进程或修改文件。</p></>
+            ) : (
+              <><h2>无法确认最近任务是否已经结束</h2><p>Guardian 已按安全规则停止切换。请等待界面停止输出并正常退出 Codex，再刷新检测。</p></>
+            )
           ) : divergentCount ? (
             <>
               <h2>发现 {divergentCount} 组同 ID 聊天正文分叉</h2>
@@ -745,7 +754,14 @@ function Protection({
                 <span>{divergentCount} 组冲突</span>
                 <span>{conflictCopies} 个原始副本</span>
                 <span>{conflicts?.can_isolate ? "可安全隔离" : "需要人工只读核对"}</span>
+                {interruptedTurnCount ? <span>{interruptedTurnCount} 个已中断任务标记</span> : null}
               </div>
+            </>
+          ) : interruptedTurnCount ? (
+            <>
+              <h2>未发现正在运行的任务</h2>
+              <p>已确认 Codex 后台写入进程未运行；{interruptedTurnCount} 个未收尾标记已归类为中断记录，不再阻止切换。</p>
+              <div className="conflict-summary"><span>{interruptedTurnCount} 个已中断任务标记</span></div>
             </>
           ) : conflicts ? (
             <><h2>未发现正文冲突，当前没有进行中任务</h2><p>账号切换仍会在执行瞬间再次复核；Guardian 不会强制结束 Codex。</p></>

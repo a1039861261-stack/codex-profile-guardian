@@ -324,6 +324,50 @@ class GuardianServiceTests(unittest.TestCase):
         self.assertTrue(status["safe"])
         self.assertEqual(status["active_count"], 0)
 
+    def test_unfinished_marker_is_interrupted_when_no_writer_process_exists(self) -> None:
+        with self.active_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n")
+
+        with patch.object(self.service, "_codex_turn_writer_state", return_value="stopped"):
+            status = self.service.active_turn_status()
+
+        self.assertTrue(status["safe"])
+        self.assertEqual(status["active_count"], 0)
+        self.assertEqual(status["interrupted_count"], 1)
+        self.assertEqual(status["event_started_count"], 1)
+        self.assertEqual(status["uncertain_count"], 0)
+        self.assertEqual(status["process_state"], "stopped")
+        self.assertFalse(status["process_query_uncertain"])
+
+    def test_unfinished_marker_remains_active_while_writer_process_exists(self) -> None:
+        with self.active_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n")
+
+        with patch.object(self.service, "_codex_turn_writer_state", return_value="running"):
+            status = self.service.active_turn_status()
+
+        self.assertFalse(status["safe"])
+        self.assertEqual(status["active_count"], 1)
+        self.assertEqual(status["interrupted_count"], 0)
+        self.assertEqual(status["process_state"], "running")
+
+    def test_writer_process_query_failure_fails_closed(self) -> None:
+        with self.active_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n")
+
+        with patch.object(self.service, "_codex_turn_writer_state", return_value="unknown"):
+            status = self.service.active_turn_status()
+            with self.assertRaises(GuardianPublicError) as raised:
+                self.service._ensure_no_active_turns()
+
+        self.assertFalse(status["safe"])
+        self.assertEqual(status["active_count"], 0)
+        self.assertEqual(status["interrupted_count"], 0)
+        self.assertEqual(status["uncertain_count"], 1)
+        self.assertTrue(status["process_query_uncertain"])
+        self.assertEqual(raised.exception.code, "codex_turn_state_uncertain")
+        self.assertIn("后台进程状态", raised.exception.public_message)
+
     def test_active_turn_scan_crosses_old_eight_megabyte_tail_limit(self) -> None:
         with self.active_path.open("ab") as handle:
             handle.write(b'{"type":"event_msg","payload":{"type":"task_started"}}\n')
@@ -381,6 +425,25 @@ class GuardianServiceTests(unittest.TestCase):
         self.assertFalse(status["health"]["safe"])
         self.assertFalse(status["health"]["history_conflicts_clear"])
         self.assertEqual(status["rollouts"]["divergent_duplicate_ids"], 1)
+
+    def test_interrupted_marker_does_not_block_resolvable_conflict_isolation(self) -> None:
+        self.active_path.write_bytes(
+            self.active_path.read_bytes()
+            + b'{"type":"event_msg","payload":{"type":"task_started"}}\n'
+            + b'{"type":"response_item","payload":{"marker":"canonical"}}\n'
+        )
+        duplicate = self.codex / "archived_sessions" / f"duplicate-{self.active_id}.jsonl"
+        duplicate.write_bytes(
+            self.active_path.read_bytes().split(b"\n", 1)[0]
+            + b'\n{"type":"response_item","payload":{"marker":"branch"}}\n'
+        )
+
+        with patch.object(self.service, "_codex_turn_writer_state", return_value="stopped"):
+            report = self.service.history_conflict_report()
+
+        self.assertTrue(report["can_isolate"])
+        self.assertEqual(report["active_turns"]["active_count"], 0)
+        self.assertEqual(report["active_turns"]["interrupted_count"], 1)
 
     def test_confirmed_conflict_isolation_keeps_canonical_and_full_cold_backup(self) -> None:
         index = json.dumps({"id": self.active_id, "thread_name": "Active"}) + "\n"
@@ -2011,7 +2074,7 @@ for line in sys.stdin:
 
     def test_auto_close_never_falls_back_to_force_for_remaining_process_tree(self) -> None:
         self.service.is_fixture = False
-        self.service._codex_related_running = Mock(return_value=True)  # type: ignore[method-assign]
+        self.service._codex_related_process_state = Mock(return_value=True)  # type: ignore[method-assign]
         with patch("backend.guardian.subprocess.run") as run, patch(
             "backend.guardian.time.time", side_effect=[0, 10]
         ):
@@ -2028,12 +2091,58 @@ for line in sys.stdin:
 
     def test_ensure_closed_handles_orphaned_packaged_app_server(self) -> None:
         self.service.is_fixture = False
-        self.service._codex_related_running = Mock(return_value=True)  # type: ignore[method-assign]
+        self.service._codex_related_process_state = Mock(return_value=True)  # type: ignore[method-assign]
         self.service.request_close_codex = Mock(return_value=True)  # type: ignore[method-assign]
 
         self.service._ensure_codex_closed()
 
         self.service.request_close_codex.assert_called_once_with()  # type: ignore[attr-defined]
+
+    def test_process_query_is_tristate_and_requires_a_valid_sentinel(self) -> None:
+        success = subprocess.CompletedProcess([], 0, "GUARDIAN_PROCESS_COUNT=2\n", "")
+        empty = subprocess.CompletedProcess([], 0, "GUARDIAN_PROCESS_COUNT=0\n", "")
+        malformed = subprocess.CompletedProcess([], 0, "0\n", "")
+        failed = subprocess.CompletedProcess([], 2, "GUARDIAN_PROCESS_QUERY_ERROR\n", "")
+
+        with patch("backend.guardian.subprocess.run", return_value=success) as run:
+            self.assertTrue(GuardianService._windows_process_match_state("$true"))
+        script = run.call_args.args[0][-1]
+        self.assertIn("Get-CimInstance Win32_Process -ErrorAction Stop", script)
+        self.assertIn("GUARDIAN_PROCESS_COUNT=", script)
+        with patch("backend.guardian.subprocess.run", return_value=empty):
+            self.assertFalse(GuardianService._windows_process_match_state("$true"))
+        with patch("backend.guardian.subprocess.run", return_value=malformed):
+            self.assertIsNone(GuardianService._windows_process_match_state("$true"))
+        with patch("backend.guardian.subprocess.run", return_value=failed):
+            self.assertIsNone(GuardianService._windows_process_match_state("$true"))
+
+    def test_writer_filter_covers_cli_without_expanding_close_scope(self) -> None:
+        writer_filter = GuardianService._windows_codex_writer_process_filter()
+        close_filter = GuardianService._windows_codex_related_process_filter()
+
+        self.assertIn("$_.Name -ieq 'codex.exe'", writer_filter)
+        self.assertIn("node.exe", writer_filter)
+        self.assertIn("@openai", writer_filter)
+        self.assertNotIn("node.exe", close_filter)
+
+    def test_process_query_failure_never_counts_as_codex_closed(self) -> None:
+        self.service.is_fixture = False
+        self.service._codex_related_process_state = Mock(return_value=None)  # type: ignore[method-assign]
+
+        with patch("backend.guardian.subprocess.run") as run:
+            self.assertFalse(self.service.request_close_codex())
+
+        run.assert_not_called()
+
+    def test_ensure_closed_fails_closed_when_process_query_is_uncertain(self) -> None:
+        self.service.is_fixture = False
+        self.service._codex_related_process_state = Mock(return_value=None)  # type: ignore[method-assign]
+
+        with self.assertRaises(GuardianPublicError) as raised:
+            self.service._ensure_codex_closed()
+
+        self.assertEqual(raised.exception.code, "codex_process_state_uncertain")
+        self.assertIn("未修改任何文件", raised.exception.public_message)
 
     def test_launch_uses_new_chatgpt_app_id_and_verifies_process(self) -> None:
         self.service.is_fixture = False

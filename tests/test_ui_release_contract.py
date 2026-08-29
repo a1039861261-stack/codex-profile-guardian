@@ -114,6 +114,14 @@ class UIReleaseContractTests(unittest.TestCase):
         self.assertIn("无法确认最近任务是否已经结束", application)
         self.assertIn("无法安全确认最近任务是否结束；Guardian 未关闭 Codex，也未修改任何文件。", application)
 
+    def test_interrupted_turn_markers_are_visible_without_claiming_they_are_running(self) -> None:
+        application = (self.project / "src" / "App.jsx").read_text(encoding="utf-8")
+        self.assertIn("conflicts?.active_turns?.interrupted_count || 0", application)
+        self.assertIn("未发现正在运行的任务", application)
+        self.assertIn("未收尾标记已归类为中断记录，不再阻止切换", application)
+        self.assertIn("无法确认 Codex 后台进程状态", application)
+        self.assertIn("后台 app-server 或 CLI 写入进程仍可能继续任务", application)
+
     def test_product_styles_keep_an_eleven_pixel_font_floor(self) -> None:
         pattern = re.compile(r"font(?:-size)?\s*:[^;]*(?<!\d)(?:8|9|10)px")
         for stylesheet_path in (self.project / "src").rglob("*.css"):

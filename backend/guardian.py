@@ -48,7 +48,7 @@ from gateway.protocols.responses import normalize_protocol_compatibility
 
 
 APP_NAME = "Codex Profile Guardian"
-APP_VERSION = "1.10.1"
+APP_VERSION = "1.10.2"
 SCHEMA_VERSION = 1
 MANAGED_START = "# BEGIN CODEX PROFILE GUARDIAN MANAGED"
 MANAGED_END = "# END CODEX PROFILE GUARDIAN MANAGED"
@@ -2302,12 +2302,33 @@ class GuardianService:
         )
         return f"(({cls._windows_codex_process_filter()}) -or ({app_server}))"
 
+    @classmethod
+    def _windows_codex_writer_process_filter(cls) -> str:
+        # A writer may be the desktop app, its packaged app-server, a native
+        # codex CLI, or the legacy Node.js CLI. This filter is read-only and is
+        # intentionally broader than the process tree Guardian may close.
+        native_cli = "($_.Name -ieq 'codex.exe')"
+        node_cli = (
+            "(($_.Name -ieq 'node.exe') -and ($_.CommandLine -match "
+            "'@openai[\\\\/]codex|node_modules[\\\\/]@openai[\\\\/]codex'))"
+        )
+        return (
+            f"(({cls._windows_codex_process_filter()}) -or "
+            f"({native_cli}) -or ({node_cli}))"
+        )
+
     @staticmethod
-    def _windows_processes_running(process_filter: str) -> bool:
+    def _windows_process_match_state(process_filter: str) -> bool | None:
         script = (
-            "$p=@(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
-            "Where-Object { " + process_filter + " }); "
-            "@($p).Count"
+            "$ErrorActionPreference='Stop'; "
+            "try { "
+            "$all=@(Get-CimInstance Win32_Process -ErrorAction Stop); "
+            "$p=@($all | Where-Object { " + process_filter + " }); "
+            "[Console]::Out.WriteLine(('GUARDIAN_PROCESS_COUNT=' + [string](@($p).Count))); "
+            "exit 0 "
+            "} catch { "
+            "[Console]::Out.WriteLine('GUARDIAN_PROCESS_QUERY_ERROR'); exit 2 "
+            "}"
         )
         command = ["powershell.exe", "-NoProfile", "-Command", script]
         try:
@@ -2318,9 +2339,21 @@ class GuardianService:
                 timeout=5,
                 creationflags=0x08000000,
             )
-            return int((result.stdout or "0").strip().splitlines()[-1]) > 0
+            if result.returncode != 0:
+                return None
+            match = re.search(
+                r"(?m)^GUARDIAN_PROCESS_COUNT=(\d+)\s*$",
+                result.stdout or "",
+            )
+            if match is None:
+                return None
+            return int(match.group(1)) > 0
         except Exception:
-            return False
+            return None
+
+    @classmethod
+    def _windows_processes_running(cls, process_filter: str) -> bool:
+        return cls._windows_process_match_state(process_filter) is True
 
     def codex_running(self) -> bool:
         if os.name != "nt":
@@ -2334,9 +2367,33 @@ class GuardianService:
             self._windows_codex_related_process_filter()
         )
 
+    def _codex_related_process_state(self) -> bool | None:
+        if os.name != "nt":
+            return False
+        return self._windows_process_match_state(
+            self._windows_codex_related_process_filter()
+        )
+
+    def _codex_turn_writer_state(self) -> str:
+        if self.is_fixture or os.name != "nt":
+            return "event_only"
+        state = self._windows_process_match_state(
+            self._windows_codex_writer_process_filter()
+        )
+        if state is True:
+            return "running"
+        if state is False:
+            return "stopped"
+        return "unknown"
+
     def request_close_codex(self, timeout_seconds: int = 15) -> bool:
-        if self.is_fixture or not self._codex_related_running():
+        if self.is_fixture:
             return True
+        initial_state = self._codex_related_process_state()
+        if initial_state is False:
+            return True
+        if initial_state is None:
+            return False
         discover = (
             "$all=@(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
             "Where-Object { " + self._windows_codex_related_process_filter() + " }); "
@@ -2354,8 +2411,11 @@ class GuardianService:
         )
         graceful_deadline = time.time() + min(5, max(2, timeout_seconds // 2))
         while time.time() < graceful_deadline:
-            if not self._codex_related_running():
+            state = self._codex_related_process_state()
+            if state is False:
                 return True
+            if state is None:
+                return False
             time.sleep(0.4)
 
         return False
@@ -2427,7 +2487,7 @@ class GuardianService:
 
     def active_turn_status(self) -> dict[str, Any]:
         now = time.time()
-        active_count = 0
+        event_started_count = 0
         uncertain_count = 0
         newest_mtime_ns: int | None = None
         recent_files = 0
@@ -2436,15 +2496,32 @@ class GuardianService:
             if mtime_ns is not None and now - (mtime_ns / 1_000_000_000) <= ACTIVE_TURN_LOOKBACK_SECONDS:
                 recent_files += 1
             if state == "task_started":
-                active_count += 1
+                event_started_count += 1
                 newest_mtime_ns = max(newest_mtime_ns or 0, int(mtime_ns or 0))
             elif state == "turn_state_uncertain":
                 uncertain_count += 1
                 newest_mtime_ns = max(newest_mtime_ns or 0, int(mtime_ns or 0))
+        active_count = event_started_count
+        interrupted_count = 0
+        process_state = "not_checked"
+        process_query_uncertain = False
+        if event_started_count:
+            process_state = self._codex_turn_writer_state()
+            if process_state == "stopped":
+                interrupted_count = event_started_count
+                active_count = 0
+            elif process_state == "unknown":
+                active_count = 0
+                uncertain_count += event_started_count
+                process_query_uncertain = True
         return {
             "safe": active_count == 0 and uncertain_count == 0,
             "active_count": active_count,
+            "interrupted_count": interrupted_count,
+            "event_started_count": event_started_count,
             "uncertain_count": uncertain_count,
+            "process_state": process_state,
+            "process_query_uncertain": process_query_uncertain,
             "recent_files_checked": recent_files,
             "lookback_seconds": ACTIVE_TURN_LOOKBACK_SECONDS,
             "newest_mtime_ns": newest_mtime_ns,
@@ -2453,20 +2530,39 @@ class GuardianService:
     def _ensure_no_active_turns(self) -> None:
         status = self.active_turn_status()
         if status["safe"]:
+            if status["interrupted_count"]:
+                self._log(
+                    "history.interrupted_turn_marker",
+                    "success",
+                    "已确认 Codex 写入进程未运行，未收尾任务标记不再阻止切换",
+                    interrupted_count=status["interrupted_count"],
+                    process_state=status["process_state"],
+                )
             return
         if status["uncertain_count"]:
+            process_query_uncertain = bool(status["process_query_uncertain"])
             self._log(
                 "history.turn_state_uncertain",
                 "warning",
-                "无法完整确认最近 Codex 任务状态，未关闭 Codex，未开始切换",
+                (
+                    "无法确认 Codex 后台进程状态，未关闭 Codex，未开始切换"
+                    if process_query_uncertain
+                    else "无法完整确认最近 Codex 任务状态，未关闭 Codex，未开始切换"
+                ),
                 uncertain_count=status["uncertain_count"],
+                process_query_uncertain=process_query_uncertain,
             )
             raise GuardianPublicError(
                 "codex_turn_state_uncertain",
-                "无法安全确认最近 Codex 任务是否已经结束。请等待当前界面停止输出并正常退出 Codex，再重新检测；Guardian 未修改任何文件。",
+                (
+                    "无法查询 Codex 后台进程状态，因此不能确认未收尾任务是否已中断。请重试检测；Guardian 未关闭 Codex，也未修改任何文件。"
+                    if process_query_uncertain
+                    else "无法安全确认最近 Codex 任务是否已经结束。请等待当前界面停止输出并正常退出 Codex，再重新检测；Guardian 未修改任何文件。"
+                ),
                 details={
                     "uncertain_count": status["uncertain_count"],
                     "lookback_seconds": status["lookback_seconds"],
+                    "process_query_uncertain": process_query_uncertain,
                 },
                 retryable=True,
             )
@@ -2519,8 +2615,15 @@ class GuardianService:
         self._ensure_no_active_turns()
         if self.is_fixture:
             return
-        if not self._codex_related_running():
+        related_state = self._codex_related_process_state()
+        if related_state is False:
             return
+        if related_state is None:
+            raise GuardianPublicError(
+                "codex_process_state_uncertain",
+                "无法查询 Codex 后台进程状态，Guardian 未关闭进程，也未修改任何文件。请重试后再切换。",
+                retryable=True,
+            )
         if settings.get("auto_close_codex", True) and self.request_close_codex():
             self._ensure_no_active_turns()
             return

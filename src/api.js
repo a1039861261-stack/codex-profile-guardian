@@ -5,13 +5,14 @@ const API_BASE = window.location.port === "5173"
 let sessionPromise = null;
 
 export class ApiError extends Error {
-  constructor(message, { code = "request_failed", status = 0, fieldErrors = null, retryable = false } = {}) {
+  constructor(message, { code = "request_failed", status = 0, fieldErrors = null, retryable = false, details = null } = {}) {
     super(message);
     this.name = "ApiError";
     this.code = code;
     this.status = status;
     this.fieldErrors = fieldErrors;
     this.retryable = retryable;
+    this.details = details;
   }
 }
 
@@ -23,6 +24,7 @@ function errorFromPayload(payload, status) {
       status,
       fieldErrors: value.field_errors || null,
       retryable: Boolean(value.retryable),
+      details: value.details || null,
     });
   }
   return new ApiError(typeof value === "string" && value ? value : `HTTP ${status}`, { status });

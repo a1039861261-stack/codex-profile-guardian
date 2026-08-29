@@ -392,6 +392,12 @@ class HttpFailoverMatrixTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def timeout_cases() -> tuple[tuple[str, ScriptedScenario, GatewayLimits], ...]:
         frames = text_sse_frames("TIMEOUT_FIXTURE", response_id="resp_timeout_fixture")
+        # IsolatedAsyncioTestCase enables asyncio debug mode.  On a busy Windows
+        # host that can add more than 100 ms of scheduling overhead to the
+        # otherwise immediate backup fixture.  Keep a wide gap between the
+        # timeout that trips P1 and the budget that lets a zero-delay P2 finish;
+        # the assertions below still prove each timeout class and exactly one
+        # failover attempt without making the result depend on host speed.
         common = {
             "max_request_bytes": 1024 * 1024,
             "max_response_bytes": 1024 * 1024,
@@ -404,13 +410,13 @@ class HttpFailoverMatrixTests(unittest.IsolatedAsyncioTestCase):
                 ScriptedScenario(
                     name="first_byte_timeout",
                     chunks=frames,
-                    chunk_delays=(0.20,),
+                    chunk_delays=(0.75,),
                 ),
                 GatewayLimits(
                     **common,
-                    first_byte_timeout_seconds=0.05,
-                    idle_timeout_seconds=0.25,
-                    total_timeout_seconds=0.5,
+                    first_byte_timeout_seconds=0.35,
+                    idle_timeout_seconds=0.50,
+                    total_timeout_seconds=1.50,
                 ),
             ),
             (
@@ -418,13 +424,13 @@ class HttpFailoverMatrixTests(unittest.IsolatedAsyncioTestCase):
                 ScriptedScenario(
                     name="idle_timeout",
                     chunks=frames,
-                    chunk_delays=(0.0, 0.20),
+                    chunk_delays=(0.0, 0.75),
                 ),
                 GatewayLimits(
                     **common,
-                    first_byte_timeout_seconds=0.10,
-                    idle_timeout_seconds=0.05,
-                    total_timeout_seconds=0.5,
+                    first_byte_timeout_seconds=0.50,
+                    idle_timeout_seconds=0.35,
+                    total_timeout_seconds=1.50,
                 ),
             ),
             (
@@ -432,13 +438,13 @@ class HttpFailoverMatrixTests(unittest.IsolatedAsyncioTestCase):
                 ScriptedScenario(
                     name="total_timeout",
                     chunks=frames,
-                    chunk_delays=tuple(0.05 for _frame in frames),
+                    chunk_delays=tuple(0.25 for _frame in frames),
                 ),
                 GatewayLimits(
                     **common,
-                    first_byte_timeout_seconds=0.10,
-                    idle_timeout_seconds=0.10,
-                    total_timeout_seconds=0.18,
+                    first_byte_timeout_seconds=0.50,
+                    idle_timeout_seconds=0.50,
+                    total_timeout_seconds=0.75,
                 ),
             ),
         )

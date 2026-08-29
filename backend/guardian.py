@@ -48,14 +48,36 @@ from gateway.protocols.responses import normalize_protocol_compatibility
 
 
 APP_NAME = "Codex Profile Guardian"
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.10.1"
 SCHEMA_VERSION = 1
 MANAGED_START = "# BEGIN CODEX PROFILE GUARDIAN MANAGED"
 MANAGED_END = "# END CODEX PROFILE GUARDIAN MANAGED"
+ACTIVE_TURN_LOOKBACK_SECONDS = 10 * 60
+ACTIVE_TURN_SCAN_BLOCK_BYTES = 256 * 1024
+ACTIVE_TURN_MAX_JSON_LINE_BYTES = 1024 * 1024
+ACTIVE_TURN_MAX_SCAN_BYTES = 512 * 1024 * 1024
 
 
 class GuardianError(RuntimeError):
     pass
+
+
+class GuardianPublicError(GuardianError):
+    """A bounded, user-safe failure that the management API may display verbatim."""
+
+    def __init__(
+        self,
+        code: str,
+        public_message: str,
+        *,
+        details: dict[str, Any] | None = None,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(public_message)
+        self.code = code
+        self.public_message = public_message
+        self.details = details or {}
+        self.retryable = retryable
 
 
 class GuardianDiagnosticError(GuardianError):
@@ -398,6 +420,8 @@ class GuardianService:
         self.profiles_path = self.data_dir / "profiles.json"
         self.secrets_dir = self.data_dir / "secrets"
         self.backups_dir = self.data_dir / "backups"
+        self.history_cold_backups_dir = self.data_dir / "history-cold-backups"
+        self.history_conflicts_dir = self.data_dir / "history-conflicts"
         self.logs_path = self.data_dir / "events.jsonl"
         self.updater = updater or GitHubReleaseUpdater(APP_VERSION, self.data_dir)
         self.helper_command = helper_command or self._default_helper_command()
@@ -415,6 +439,8 @@ class GuardianService:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.secrets_dir.mkdir(parents=True, exist_ok=True)
         self.backups_dir.mkdir(parents=True, exist_ok=True)
+        self.history_cold_backups_dir.mkdir(parents=True, exist_ok=True)
+        self.history_conflicts_dir.mkdir(parents=True, exist_ok=True)
         self._cleanup_quota_temp_dirs()
         if not self.profiles_path.exists():
             atomic_json(self.profiles_path, self._empty_state())
@@ -2135,12 +2161,23 @@ class GuardianService:
                 continue
             providers[provider] = providers.get(provider, 0) + 1
             ids[thread_id] = ids.get(thread_id, 0) + 1
-        return {
+        result = {
             "total": total,
             "providers": providers,
             "invalid": invalid,
             "duplicate_ids": sum(1 for count in ids.values() if count > 1),
+            "prefix_duplicate_ids": 0,
+            "divergent_duplicate_ids": 0,
+            "duplicate_body_check_error": False,
         }
+        if result["duplicate_ids"] and not invalid:
+            try:
+                inventory = self._rollout_inventory(refuse_divergent=False)
+                result["prefix_duplicate_ids"] = int(inventory["prefix_duplicate_ids"])
+                result["divergent_duplicate_ids"] = int(inventory["divergent_duplicate_ids"])
+            except GuardianError:
+                result["duplicate_body_check_error"] = True
+        return result
 
     def status(self) -> dict[str, Any]:
         state = self._load_state()
@@ -2176,6 +2213,8 @@ class GuardianService:
             database["integrity"] == "ok"
             and self.codex_home.exists()
             and shared_history_ready
+            and not rollouts["divergent_duplicate_ids"]
+            and not rollouts["duplicate_body_check_error"]
         )
         return {
             "app": {"name": APP_NAME, "version": APP_VERSION},
@@ -2195,6 +2234,8 @@ class GuardianService:
                 "config_present": (self.codex_home / "config.toml").is_file(),
                 "archive_preserved": True,
                 "shared_history_ready": shared_history_ready,
+                "history_conflicts_clear": not rollouts["divergent_duplicate_ids"]
+                and not rollouts["duplicate_body_check_error"],
                 "global_settings_shared": True,
                 "chatgpt_process_compatible": True,
             },
@@ -2317,23 +2358,133 @@ class GuardianService:
                 return True
             time.sleep(0.4)
 
-        force_script = (
-            "$all=@(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
-            "Where-Object { " + self._windows_codex_related_process_filter() + " }); "
-            "foreach($p in $all){ & taskkill.exe /F /PID $p.ProcessId /T 2>$null | Out-Null }"
-        )
-        subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command", force_script],
-            capture_output=True,
-            timeout=8,
-            creationflags=0x08000000,
-        )
-        deadline = time.time() + timeout_seconds
-        while time.time() < deadline:
-            if not self._codex_related_running():
-                return True
-            time.sleep(0.4)
         return False
+
+    @staticmethod
+    def _recent_rollout_turn_state(path: Path, *, now: float) -> tuple[str | None, int | None]:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None, None
+        age_seconds = max(0.0, now - stat.st_mtime)
+        if age_seconds > ACTIVE_TURN_LOOKBACK_SECONDS:
+            return None, stat.st_mtime_ns
+        scanned = 0
+        pending = b""
+        skipping_oversized_line = False
+        try:
+            with path.open("rb") as source:
+                position = stat.st_size
+                while position > 0 and scanned < ACTIVE_TURN_MAX_SCAN_BYTES:
+                    read_size = min(
+                        ACTIVE_TURN_SCAN_BLOCK_BYTES,
+                        position,
+                        ACTIVE_TURN_MAX_SCAN_BYTES - scanned,
+                    )
+                    position -= read_size
+                    source.seek(position)
+                    chunk = source.read(read_size)
+                    if len(chunk) != read_size:
+                        return "turn_state_uncertain", stat.st_mtime_ns
+                    scanned += read_size
+
+                    if skipping_oversized_line:
+                        boundary = chunk.rfind(b"\n")
+                        if boundary < 0:
+                            continue
+                        chunk = chunk[: boundary + 1]
+                        skipping_oversized_line = False
+
+                    combined = chunk + pending
+                    parts = combined.split(b"\n")
+                    if position > 0:
+                        pending = parts[0]
+                        complete_lines = parts[1:]
+                        if len(pending) > ACTIVE_TURN_MAX_JSON_LINE_BYTES:
+                            pending = b""
+                            skipping_oversized_line = True
+                    else:
+                        pending = b""
+                        complete_lines = parts
+
+                    for raw in reversed(complete_lines):
+                        raw = raw.rstrip(b"\r")
+                        if not raw or len(raw) > ACTIVE_TURN_MAX_JSON_LINE_BYTES:
+                            continue
+                        try:
+                            item = json.loads(raw)
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            continue
+                        payload = item.get("payload") if isinstance(item, dict) else None
+                        kind = payload.get("type") if isinstance(payload, dict) else None
+                        if kind in {"task_started", "task_complete", "turn_aborted"}:
+                            return str(kind), stat.st_mtime_ns
+        except OSError:
+            return "turn_state_uncertain", stat.st_mtime_ns
+        if position > 0 or skipping_oversized_line:
+            return "turn_state_uncertain", stat.st_mtime_ns
+        return None, stat.st_mtime_ns
+
+    def active_turn_status(self) -> dict[str, Any]:
+        now = time.time()
+        active_count = 0
+        uncertain_count = 0
+        newest_mtime_ns: int | None = None
+        recent_files = 0
+        for path in self._rollout_files():
+            state, mtime_ns = self._recent_rollout_turn_state(path, now=now)
+            if mtime_ns is not None and now - (mtime_ns / 1_000_000_000) <= ACTIVE_TURN_LOOKBACK_SECONDS:
+                recent_files += 1
+            if state == "task_started":
+                active_count += 1
+                newest_mtime_ns = max(newest_mtime_ns or 0, int(mtime_ns or 0))
+            elif state == "turn_state_uncertain":
+                uncertain_count += 1
+                newest_mtime_ns = max(newest_mtime_ns or 0, int(mtime_ns or 0))
+        return {
+            "safe": active_count == 0 and uncertain_count == 0,
+            "active_count": active_count,
+            "uncertain_count": uncertain_count,
+            "recent_files_checked": recent_files,
+            "lookback_seconds": ACTIVE_TURN_LOOKBACK_SECONDS,
+            "newest_mtime_ns": newest_mtime_ns,
+        }
+
+    def _ensure_no_active_turns(self) -> None:
+        status = self.active_turn_status()
+        if status["safe"]:
+            return
+        if status["uncertain_count"]:
+            self._log(
+                "history.turn_state_uncertain",
+                "warning",
+                "无法完整确认最近 Codex 任务状态，未关闭 Codex，未开始切换",
+                uncertain_count=status["uncertain_count"],
+            )
+            raise GuardianPublicError(
+                "codex_turn_state_uncertain",
+                "无法安全确认最近 Codex 任务是否已经结束。请等待当前界面停止输出并正常退出 Codex，再重新检测；Guardian 未修改任何文件。",
+                details={
+                    "uncertain_count": status["uncertain_count"],
+                    "lookback_seconds": status["lookback_seconds"],
+                },
+                retryable=True,
+            )
+        self._log(
+            "history.active_turn_blocked",
+            "warning",
+            f"检测到 {status['active_count']} 个正在执行的 Codex 任务，未关闭 Codex，未开始切换",
+            active_count=status["active_count"],
+        )
+        raise GuardianPublicError(
+            "codex_active_turn",
+            "检测到 Codex 仍有正在执行的任务。请等待当前回复完整结束，再重新安全切换；Guardian 未关闭 Codex，也未修改任何文件。",
+            details={
+                "active_count": status["active_count"],
+                "lookback_seconds": status["lookback_seconds"],
+            },
+            retryable=True,
+        )
 
     def launch_codex(self) -> bool:
         if self.is_fixture or os.name != "nt":
@@ -2365,13 +2516,19 @@ class GuardianService:
 
     def _ensure_codex_closed(self) -> None:
         settings = self._load_state().get("settings", {})
+        self._ensure_no_active_turns()
         if self.is_fixture:
             return
         if not self._codex_related_running():
             return
         if settings.get("auto_close_codex", True) and self.request_close_codex():
+            self._ensure_no_active_turns()
             return
-        raise GuardianError("Codex 进程仍在运行，自动关闭失败。请保存工作后完全退出 Codex，再重试。")
+        raise GuardianPublicError(
+            "codex_close_incomplete",
+            "Codex 未能安全退出。Guardian 不会强制结束进程；请确认任务已完成并手动退出 Codex，然后重试。",
+            retryable=True,
+        )
 
     def _copy_backup_file(self, source: Path, backup_root: Path) -> str:
         try:
@@ -2628,6 +2785,208 @@ class GuardianService:
         self._log("backup.create", "success", f"已创建安全备份：{backup_root.name}", reason=reason)
         return self._backup_summary(backup_root)
 
+    @staticmethod
+    def _validate_jsonl_structure(path: Path) -> int:
+        line_count = 0
+        with path.open("rb") as source:
+            for raw in source:
+                if not raw.strip():
+                    continue
+                try:
+                    json.loads(raw.decode("utf-8-sig" if line_count == 0 else "utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise GuardianError("完整冷备前发现无法解析的会话 JSONL，已停止处理。") from exc
+                line_count += 1
+        if line_count == 0:
+            raise GuardianError("完整冷备前发现空会话文件，已停止处理。")
+        return line_count
+
+    def _copy_verified_history_file(
+        self,
+        source: Path,
+        destination: Path,
+        *,
+        label: str,
+        validate_jsonl: bool = False,
+    ) -> dict[str, Any]:
+        source = source.resolve()
+        before_stat = source.stat()
+        line_count = self._validate_jsonl_structure(source) if validate_jsonl else None
+        before_hash = sha256(source)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        destination_hash = sha256(destination)
+        after_stat = source.stat()
+        after_hash = sha256(source)
+        if (
+            destination_hash != before_hash
+            or after_hash != before_hash
+            or after_stat.st_size != before_stat.st_size
+            or after_stat.st_mtime_ns != before_stat.st_mtime_ns
+        ):
+            raise GuardianError("完整冷备期间源文件发生变化或副本哈希不一致，已停止处理。")
+        return {
+            "relative": label,
+            "size": before_stat.st_size,
+            "mtime_ns": before_stat.st_mtime_ns,
+            "sha256": before_hash,
+            "jsonl_lines": line_count,
+        }
+
+    def create_history_cold_backup(self, reason: str) -> dict[str, Any]:
+        """Copy and hash every protected local history surface before an authorized repair."""
+        self._ensure_codex_closed()
+        if re.fullmatch(r"[a-z0-9-]{1,64}", reason) is None:
+            raise GuardianError("完整冷备原因无效。")
+        database_location = self._state_database_location()
+        database = Path(database_location["path"])
+        rollout_files = self._rollout_files()
+        regular_files = [
+            path
+            for path in [
+                self.codex_home / "config.toml",
+                self.codex_home / "session_index.jsonl",
+                self.codex_home / ".codex-global-state.json",
+            ]
+            if path.is_file()
+        ]
+        auth_path = self.codex_home / "auth.json"
+        database_files = [database] if database.is_file() else []
+        database_files.extend(
+            path for path in [Path(str(database) + "-wal"), Path(str(database) + "-shm")] if path.is_file()
+        )
+        source_files = [*rollout_files, *regular_files, *database_files]
+        source_bytes = sum(path.stat().st_size for path in source_files)
+        if auth_path.is_file():
+            source_bytes += auth_path.stat().st_size
+        # Keep both a raw SQLite snapshot (plus sidecars) and a logical backup.
+        estimated_backup_bytes = source_bytes + (database.stat().st_size if database.is_file() else 0)
+        reserve_bytes = max(64 * 1024 * 1024, estimated_backup_bytes // 20)
+        free_bytes = shutil.disk_usage(self.data_dir).free
+        if free_bytes < estimated_backup_bytes + reserve_bytes:
+            raise GuardianPublicError(
+                "history_cold_backup_space_insufficient",
+                "磁盘空间不足，无法为聊天冲突创建完整冷备。未修改任何聊天文件。",
+                details={
+                    "required_bytes": estimated_backup_bytes + reserve_bytes,
+                    "free_bytes": free_bytes,
+                },
+            )
+
+        timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup_root = self.history_cold_backups_dir / f"{timestamp}-{reason}"
+        backup_root.mkdir(parents=True, exist_ok=False)
+        copied: list[dict[str, Any]] = []
+        try:
+            for source in [*regular_files, *rollout_files]:
+                relative = source.resolve().relative_to(self.codex_home)
+                copied.append(
+                    self._copy_verified_history_file(
+                        source,
+                        backup_root / "files" / relative,
+                        label=str(relative),
+                        validate_jsonl=source.suffix == ".jsonl" and source in rollout_files,
+                    )
+                )
+
+            encrypted_auth = None
+            if auth_path.is_file():
+                encrypted_auth = self._copy_encrypted_backup_file(auth_path, backup_root)
+
+            database_manifest: dict[str, Any] = {
+                "source": database_location["source"],
+                "path": str(database),
+                "stored": None,
+                "integrity": "missing",
+                "thread_count": 0,
+                "thread_map_sha256": None,
+                "raw_files": [],
+            }
+            if database.is_file():
+                for raw_database_file in database_files:
+                    raw_item = self._copy_verified_history_file(
+                        raw_database_file,
+                        backup_root / "database-raw" / raw_database_file.name,
+                        label=f"database-raw/{raw_database_file.name}",
+                    )
+                    database_manifest["raw_files"].append(raw_item)
+
+                destination_db = backup_root / "database-logical.sqlite"
+                source_connection = sqlite3.connect(database, timeout=30)
+                destination_connection = sqlite3.connect(destination_db)
+                try:
+                    source_connection.backup(destination_connection)
+                    thread_rows = list(
+                        source_connection.execute(
+                            "SELECT id, archived, rollout_path FROM threads ORDER BY id"
+                        )
+                    )
+                finally:
+                    destination_connection.close()
+                    source_connection.close()
+                verify_connection = sqlite3.connect(destination_db)
+                try:
+                    integrity = str(verify_connection.execute("PRAGMA integrity_check").fetchone()[0])
+                    backup_rows = list(
+                        verify_connection.execute(
+                            "SELECT id, archived, rollout_path FROM threads ORDER BY id"
+                        )
+                    )
+                finally:
+                    verify_connection.close()
+                if integrity != "ok" or backup_rows != thread_rows:
+                    raise GuardianError("完整冷备 SQLite 复核失败，已停止处理。")
+                logical = json.dumps(thread_rows, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                database_manifest.update(
+                    {
+                        "stored": destination_db.name,
+                        "integrity": integrity,
+                        "thread_count": len(thread_rows),
+                        "thread_map_sha256": hashlib.sha256(logical).hexdigest(),
+                        "sha256": sha256(destination_db),
+                    }
+                )
+            manifest = {
+                "schema_version": 1,
+                "name": backup_root.name,
+                "created_at": utc_now(),
+                "reason": reason,
+                "backup_mode": "full-history-cold",
+                "codex_home": str(self.codex_home),
+                "files": copied,
+                "encrypted_auth": encrypted_auth,
+                "database": database_manifest,
+                "rollout_file_count": len(rollout_files),
+                "total_source_bytes": source_bytes,
+            }
+            atomic_json(backup_root / "manifest.json", manifest)
+        except Exception as exc:
+            atomic_json(
+                backup_root / "INCOMPLETE.json",
+                {
+                    "created_at": utc_now(),
+                    "reason": reason,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise
+
+        self._log(
+            "history.cold_backup",
+            "success",
+            f"聊天冲突处理前完整冷备已完成：{backup_root.name}",
+            rollout_file_count=len(rollout_files),
+            total_source_bytes=source_bytes,
+        )
+        return {
+            "name": backup_root.name,
+            "created_at": manifest["created_at"],
+            "backup_mode": manifest["backup_mode"],
+            "rollout_file_count": len(rollout_files),
+            "total_source_bytes": source_bytes,
+            "path": str(backup_root),
+        }
+
     def _backup_summary(self, backup_root: Path) -> dict[str, Any]:
         manifest_path = backup_root / "manifest.json"
         if not manifest_path.is_file():
@@ -2808,7 +3167,10 @@ class GuardianService:
                     return False
 
     def _rollout_inventory(
-        self, *, verify_duplicate_bodies: bool = True
+        self,
+        *,
+        verify_duplicate_bodies: bool = True,
+        refuse_divergent: bool = True,
     ) -> dict[str, Any]:
         by_id: dict[str, list[dict[str, Any]]] = {}
         entries: list[dict[str, Any]] = []
@@ -2830,6 +3192,7 @@ class GuardianService:
                 raise GuardianError(f"会话文件缺少 session_meta ID，已中止迁移：{resolved.name}")
             entry = {
                 "path": resolved,
+                "thread_id": thread_id,
                 "provider": str(payload.get("model_provider") or ""),
                 "archived": archived_root in resolved.parents,
                 "active": active_root in resolved.parents,
@@ -2839,7 +3202,8 @@ class GuardianService:
         duplicate_ids = 0
         prefix_duplicate_ids = 0
         divergent_duplicate_ids = 0
-        for items in by_id.values():
+        divergent_conflicts: list[dict[str, Any]] = []
+        for thread_id, items in by_id.items():
             if len(items) < 2:
                 continue
             duplicate_ids += 1
@@ -2861,16 +3225,336 @@ class GuardianService:
                 prefix_duplicate_ids += 1
             else:
                 divergent_duplicate_ids += 1
-        if divergent_duplicate_ids:
-            raise GuardianError(
-                f"发现 {divergent_duplicate_ids} 个正文冲突的重复会话 ID，已中止迁移，未选择或删除任何文件。"
+                copies = []
+                for item, (body_bytes, body_sha256) in zip(items, signatures, strict=True):
+                    path = Path(item["path"])
+                    stat = path.stat()
+                    copies.append(
+                        {
+                            **item,
+                            "body_bytes": body_bytes,
+                            "body_sha256": body_sha256,
+                            "file_bytes": stat.st_size,
+                            "mtime_ns": stat.st_mtime_ns,
+                        }
+                    )
+                divergent_conflicts.append(
+                    {
+                        "thread_id": thread_id,
+                        "conflict_ref": hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:16],
+                        "copies": copies,
+                    }
+                )
+        if divergent_duplicate_ids and refuse_divergent:
+            raise GuardianPublicError(
+                "history_divergent_duplicates",
+                f"检测到 {divergent_duplicate_ids} 组同 ID 聊天包含不同正文。已中止并回滚，未删除任何记录；请前往“聊天保护”保留当前版本并隔离其他分支。",
+                details={"divergent_duplicate_count": divergent_duplicate_ids},
             )
         return {
             "by_id": by_id,
             "entries": entries,
             "duplicate_ids": duplicate_ids,
             "prefix_duplicate_ids": prefix_duplicate_ids,
+            "divergent_duplicate_ids": divergent_duplicate_ids,
+            "divergent_conflicts": divergent_conflicts,
         }
+
+    def _database_rollout_references(self) -> dict[str, dict[str, Any]]:
+        location = self._state_database_location()
+        db = Path(location["path"])
+        if not db.is_file():
+            return {}
+        connection = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = list(connection.execute("SELECT id, archived, rollout_path FROM threads"))
+        finally:
+            connection.close()
+        references: dict[str, dict[str, Any]] = {}
+        for thread_id_raw, archived_raw, rollout_path_raw in rows:
+            resolved_path: Path | None = None
+            if rollout_path_raw is not None:
+                candidate = Path(str(rollout_path_raw))
+                if not candidate.is_absolute():
+                    candidate = self.codex_home / candidate
+                try:
+                    resolved_path = candidate.resolve()
+                except OSError:
+                    resolved_path = None
+            references[str(thread_id_raw)] = {
+                "path": resolved_path,
+                "archived": bool(int(archived_raw or 0)),
+            }
+        return references
+
+    def history_conflict_report(self) -> dict[str, Any]:
+        inventory = self._rollout_inventory(refuse_divergent=False)
+        references = self._database_rollout_references()
+        conflicts = []
+        for conflict in inventory["divergent_conflicts"]:
+            reference = references.get(conflict["thread_id"])
+            public_copies = []
+            recommended_refs = []
+            for index, item in enumerate(conflict["copies"], start=1):
+                path = Path(item["path"])
+                relative = path.relative_to(self.codex_home)
+                copy_ref = hashlib.sha256(
+                    (
+                        conflict["conflict_ref"]
+                        + "\0"
+                        + str(relative).lower()
+                        + "\0"
+                        + str(item["body_sha256"])
+                    ).encode("utf-8")
+                ).hexdigest()[:16]
+                database_referenced = bool(reference and reference["path"] == path)
+                archive_matches = bool(
+                    reference is not None and reference["archived"] == bool(item["archived"])
+                )
+                recommended = database_referenced and archive_matches
+                if recommended:
+                    recommended_refs.append(copy_ref)
+                public_copies.append(
+                    {
+                        "copy_ref": copy_ref,
+                        "label": f"副本 {index}",
+                        "location": "archived" if item["archived"] else "active",
+                        "file_bytes": int(item["file_bytes"]),
+                        "body_sha256": str(item["body_sha256"]),
+                        "mtime_ns": int(item["mtime_ns"]),
+                        "database_referenced": database_referenced,
+                        "archive_matches": archive_matches,
+                        "recommended": recommended,
+                    }
+                )
+            conflicts.append(
+                {
+                    "conflict_ref": conflict["conflict_ref"],
+                    "copy_count": len(public_copies),
+                    "auto_resolvable": len(recommended_refs) == 1,
+                    "recommended_copy_ref": recommended_refs[0] if len(recommended_refs) == 1 else None,
+                    "copies": public_copies,
+                }
+            )
+        active_turns = self.active_turn_status()
+        return {
+            "safe_to_switch": active_turns["safe"] and not conflicts,
+            "can_isolate": bool(conflicts)
+            and active_turns["safe"]
+            and all(conflict["auto_resolvable"] for conflict in conflicts),
+            "active_turns": active_turns,
+            "rollout_file_count": len(inventory["entries"]),
+            "duplicate_id_count": int(inventory["duplicate_ids"]),
+            "prefix_duplicate_id_count": int(inventory["prefix_duplicate_ids"]),
+            "divergent_duplicate_id_count": int(inventory["divergent_duplicate_ids"]),
+            "conflicts": conflicts,
+        }
+
+    def resolve_history_conflicts(self, *, confirmed: bool) -> dict[str, Any]:
+        """Keep the SQLite-referenced copy and move divergent orphan copies to a verified vault."""
+        if not confirmed:
+            raise GuardianError("聊天冲突隔离需要明确确认。")
+        with self.lock:
+            self._ensure_codex_closed()
+            inventory = self._rollout_inventory(refuse_divergent=False)
+            conflicts = inventory["divergent_conflicts"]
+            if not conflicts:
+                return {
+                    "resolved": 0,
+                    "quarantined_files": 0,
+                    "message": "未发现需要隔离的正文分叉。",
+                }
+            references = self._database_rollout_references()
+            plan = []
+            for conflict in conflicts:
+                reference = references.get(conflict["thread_id"])
+                canonical = [
+                    item
+                    for item in conflict["copies"]
+                    if reference
+                    and reference["path"] == Path(item["path"])
+                    and reference["archived"] == bool(item["archived"])
+                ]
+                if len(canonical) != 1:
+                    raise GuardianPublicError(
+                        "history_conflict_manual_review_required",
+                        "存在无法自动确认当前版本的聊天冲突。Guardian 未移动任何文件；请保留现场并联系支持进行只读核对。",
+                        details={"manual_review_count": 1},
+                    )
+                canonical_path = Path(canonical[0]["path"])
+                other_paths = [
+                    Path(item["path"])
+                    for item in conflict["copies"]
+                    if Path(item["path"]) != canonical_path
+                ]
+                plan.append(
+                    {
+                        "conflict_ref": conflict["conflict_ref"],
+                        "canonical": canonical_path,
+                        "others": other_paths,
+                    }
+                )
+
+            cold_backup = self.create_history_cold_backup("before-conflict-isolation")
+            timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            quarantine_root = self.history_conflicts_dir / f"{timestamp}-divergent-history"
+            quarantine_root.mkdir(parents=True, exist_ok=False)
+            index_path = self.codex_home / "session_index.jsonl"
+            index_hash = sha256(index_path) if index_path.is_file() else None
+            db = Path(self._state_database_location()["path"])
+            connection = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=5)
+            try:
+                before_rows = list(
+                    connection.execute(
+                        "SELECT id, archived, rollout_path, model_provider FROM threads ORDER BY id"
+                    )
+                )
+                before_integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+            finally:
+                connection.close()
+            if before_integrity != "ok":
+                raise GuardianError("聊天冲突隔离前 SQLite 完整性检查失败。")
+
+            planned_others = {
+                path.resolve()
+                for item in plan
+                for path in item["others"]
+            }
+            initial_rollout_paths = {
+                Path(item["path"]).resolve()
+                for item in inventory["entries"]
+            }
+            preserved_hashes = {
+                path: sha256(path)
+                for path in initial_rollout_paths
+                if path not in planned_others
+            }
+            copied: list[dict[str, Any]] = []
+            removed: list[tuple[Path, Path, str]] = []
+            try:
+                active_root = (self.codex_home / "sessions").resolve()
+                archived_root = (self.codex_home / "archived_sessions").resolve()
+                for item in plan:
+                    for source in item["others"]:
+                        resolved = source.resolve()
+                        if not (
+                            (active_root in resolved.parents or archived_root in resolved.parents)
+                            and resolved.suffix == ".jsonl"
+                        ):
+                            raise GuardianError("聊天冲突文件路径越界，已停止隔离。")
+                        relative = resolved.relative_to(self.codex_home)
+                        destination = quarantine_root / "files" / relative
+                        copy_manifest = self._copy_verified_history_file(
+                            resolved,
+                            destination,
+                            label=str(relative),
+                            validate_jsonl=True,
+                        )
+                        copy_manifest["conflict_ref"] = item["conflict_ref"]
+                        copied.append(copy_manifest)
+                        removed.append((resolved, destination, str(copy_manifest["sha256"])))
+
+                atomic_json(
+                    quarantine_root / "manifest.json",
+                    {
+                        "schema_version": 1,
+                        "created_at": utc_now(),
+                        "state": "prepared",
+                        "cold_backup": cold_backup["name"],
+                        "conflict_count": len(plan),
+                        "files": copied,
+                    },
+                )
+                for source, _, expected_hash in removed:
+                    if sha256(source) != expected_hash:
+                        raise GuardianError("聊天冲突源文件在隔离前发生变化，已停止处理。")
+                    source.unlink()
+
+                after_inventory = self._rollout_inventory(refuse_divergent=False)
+                if after_inventory["divergent_duplicate_ids"]:
+                    raise GuardianError("聊天冲突隔离后仍存在正文分叉，已停止处理。")
+                after_rollout_paths = {
+                    Path(item["path"]).resolve()
+                    for item in after_inventory["entries"]
+                }
+                if after_rollout_paths != initial_rollout_paths - planned_others:
+                    raise GuardianError("聊天冲突隔离后会话文件集合发生非预期变化，已停止处理。")
+                for preserved, expected_hash in preserved_hashes.items():
+                    if sha256(preserved) != expected_hash:
+                        raise GuardianError("未隔离的聊天文件发生变化，已停止处理。")
+                connection = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=5)
+                try:
+                    after_rows = list(
+                        connection.execute(
+                            "SELECT id, archived, rollout_path, model_provider FROM threads ORDER BY id"
+                        )
+                    )
+                    after_integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+                finally:
+                    connection.close()
+                if after_integrity != "ok" or after_rows != before_rows:
+                    raise GuardianError("聊天冲突隔离后 SQLite 状态变化，已停止处理。")
+                if (sha256(index_path) if index_path.is_file() else None) != index_hash:
+                    raise GuardianError("聊天冲突隔离后会话索引发生变化，已停止处理。")
+                manifest_path = quarantine_root / "manifest.json"
+                manifest = read_json_file(manifest_path)
+                manifest["state"] = "complete"
+                manifest["completed_at"] = utc_now()
+                atomic_json(manifest_path, manifest)
+            except Exception as exc:
+                restore_failed = False
+                for source, destination, expected_hash in reversed(removed):
+                    if source.exists():
+                        continue
+                    try:
+                        source.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(destination, source)
+                        if sha256(source) != expected_hash:
+                            restore_failed = True
+                    except Exception:
+                        restore_failed = True
+                atomic_json(
+                    quarantine_root / "INCOMPLETE.json",
+                    {
+                        "created_at": utc_now(),
+                        "error_type": type(exc).__name__,
+                        "restore_failed": restore_failed,
+                        "cold_backup": cold_backup["name"],
+                    },
+                )
+                self._log(
+                    "history.conflict_isolate",
+                    "error",
+                    "聊天冲突隔离失败，已尝试恢复原路径；完整冷备和隔离副本均已保留",
+                    restore_failed=restore_failed,
+                    cold_backup=cold_backup["name"],
+                )
+                if restore_failed:
+                    raise GuardianError("聊天冲突隔离失败且自动恢复未完全通过；请保持 Codex 关闭并使用完整冷备恢复。") from exc
+                raise
+
+            self._log(
+                "history.conflict_isolate",
+                "success",
+                f"已保留当前 Codex 使用版本，并隔离 {len(removed)} 个正文分支副本",
+                conflict_count=len(plan),
+                quarantined_files=len(removed),
+                cold_backup=cold_backup["name"],
+                quarantine=quarantine_root.name,
+            )
+            return {
+                "resolved": len(plan),
+                "quarantined_files": len(removed),
+                "cold_backup": cold_backup,
+                "quarantine": {
+                    "name": quarantine_root.name,
+                    "path": str(quarantine_root),
+                },
+                "database_unchanged": True,
+                "index_unchanged": True,
+                "canonical_files_unchanged": True,
+                "preserved_rollout_files_unchanged": True,
+            }
 
     def _validate_rollout_inventory(
         self, rows: list[tuple[Any, Any, Any]], inventory: dict[str, Any]
@@ -3151,6 +3835,10 @@ class GuardianService:
                     detail = str(probe.get("message") or "API 连通性检查失败")
                     raise GuardianError(f"API 预检失败，未切换 SSH：{detail}")
             self._ensure_codex_closed()
+            # Refuse known divergent copies before changing config/auth or creating
+            # another ordinary switch backup.  The dedicated repair flow performs
+            # a full, hash-verified cold backup before isolating any branch.
+            self._rollout_inventory()
             synced_profile_id = self._sync_current_profile_environment()
             profile = self._get_profile(profile_id)
             backup = self.create_backup("before-switch")
@@ -3398,6 +4086,7 @@ class GuardianService:
     def repair_visibility(self) -> dict[str, Any]:
         with self.lock:
             self._ensure_codex_closed()
+            self._rollout_inventory()
             provider, _ = self._read_config_provider()
             backup = self.create_backup("before-shared-history-repair")
             backup_root = self.backups_dir / backup["name"]
@@ -3492,6 +4181,8 @@ class GuardianService:
             "data": self.data_dir,
             "backups": self.backups_dir,
             "codex": self.codex_home,
+            "history-cold-backups": self.history_cold_backups_dir,
+            "history-conflicts": self.history_conflicts_dir,
         }
         target = mapping.get(kind)
         if not target:

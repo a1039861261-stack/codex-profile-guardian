@@ -15,8 +15,10 @@ import unittest
 from unittest.mock import Mock, patch
 from urllib import error as urlerror
 
+import backend.guardian as guardian_module
 from backend.guardian import (
     GuardianError,
+    GuardianPublicError,
     GuardianService,
     normalize_quota_response,
     quota_plan_label,
@@ -279,8 +281,11 @@ class GuardianServiceTests(unittest.TestCase):
             "duplicate": duplicate.read_bytes(),
         }
 
-        with self.assertRaisesRegex(GuardianError, "正文冲突的重复会话 ID"):
+        with self.assertRaises(GuardianPublicError) as raised:
             self.service.switch_profile(profile["id"])
+        self.assertEqual(raised.exception.code, "history_divergent_duplicates")
+        self.assertIn("同 ID 聊天包含不同正文", raised.exception.public_message)
+        self.assertEqual(list(self.service.backups_dir.iterdir()), [])
 
         self.assertEqual((self.codex / "config.toml").read_bytes(), before["config"])
         self.assertEqual(self.active_path.read_bytes(), before["active"])
@@ -290,6 +295,201 @@ class GuardianServiceTests(unittest.TestCase):
         providers = {row[0] for row in connection.execute("SELECT model_provider FROM threads")}
         connection.close()
         self.assertEqual(providers, {"openai"})
+
+    def test_active_turn_blocks_switch_before_close_or_backup(self) -> None:
+        profile = self.service.create_api_profile(
+            "Fixture API", "http://127.0.0.1:8317/v1", "secret-key", "gpt-test"
+        )
+        with self.active_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n")
+        self.service.request_close_codex = Mock(return_value=True)  # type: ignore[method-assign]
+        original_config = (self.codex / "config.toml").read_bytes()
+
+        with self.assertRaises(GuardianPublicError) as raised:
+            self.service.switch_profile(profile["id"])
+
+        self.assertEqual(raised.exception.code, "codex_active_turn")
+        self.assertTrue(raised.exception.retryable)
+        self.assertEqual((self.codex / "config.toml").read_bytes(), original_config)
+        self.assertEqual(list(self.service.backups_dir.iterdir()), [])
+        self.service.request_close_codex.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_completed_turn_is_not_reported_as_active(self) -> None:
+        with self.active_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n")
+            handle.write(json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}) + "\n")
+
+        status = self.service.active_turn_status()
+
+        self.assertTrue(status["safe"])
+        self.assertEqual(status["active_count"], 0)
+
+    def test_active_turn_scan_crosses_old_eight_megabyte_tail_limit(self) -> None:
+        with self.active_path.open("ab") as handle:
+            handle.write(b'{"type":"event_msg","payload":{"type":"task_started"}}\n')
+            handle.write(b'{"type":"response_item","payload":{"fixture":"')
+            handle.write(b"x" * (8 * 1024 * 1024 + 4096))
+            handle.write(b'"}}\n')
+
+        status = self.service.active_turn_status()
+
+        self.assertFalse(status["safe"])
+        self.assertEqual(status["active_count"], 1)
+        self.assertEqual(status["uncertain_count"], 0)
+
+    def test_incomplete_turn_state_scan_fails_closed_before_switch(self) -> None:
+        profile = self.service.create_api_profile(
+            "Fixture API", "http://127.0.0.1:8317/v1", "secret-key", "gpt-test"
+        )
+        with self.active_path.open("ab") as handle:
+            handle.write(b"x" * 4096)
+        self.service.request_close_codex = Mock(return_value=True)  # type: ignore[method-assign]
+
+        with patch.object(guardian_module, "ACTIVE_TURN_MAX_SCAN_BYTES", 512):
+            with self.assertRaises(GuardianPublicError) as raised:
+                self.service.switch_profile(profile["id"])
+
+        self.assertEqual(raised.exception.code, "codex_turn_state_uncertain")
+        self.assertEqual(list(self.service.backups_dir.iterdir()), [])
+        self.service.request_close_codex.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_conflict_report_is_redacted_and_recommends_sqlite_copy(self) -> None:
+        self.active_path.write_bytes(
+            self.active_path.read_bytes()
+            + b'{"type":"response_item","payload":{"marker":"canonical"}}\n'
+        )
+        duplicate = self.codex / "archived_sessions" / f"duplicate-{self.active_id}.jsonl"
+        duplicate.write_bytes(
+            self.active_path.read_bytes().split(b"\n", 1)[0]
+            + b'\n{"type":"response_item","payload":{"marker":"branch"}}\n'
+        )
+
+        report = self.service.history_conflict_report()
+
+        self.assertFalse(report["safe_to_switch"])
+        self.assertTrue(report["can_isolate"])
+        self.assertEqual(report["divergent_duplicate_id_count"], 1)
+        conflict = report["conflicts"][0]
+        self.assertTrue(conflict["auto_resolvable"])
+        recommended = [item for item in conflict["copies"] if item["recommended"]]
+        self.assertEqual(len(recommended), 1)
+        self.assertTrue(recommended[0]["database_referenced"])
+        self.assertNotIn(self.active_id, json.dumps(report, ensure_ascii=False))
+        self.assertNotIn("canonical", json.dumps(report, ensure_ascii=False))
+        self.assertNotIn("branch", json.dumps(report, ensure_ascii=False))
+        status = self.service.status()
+        self.assertFalse(status["health"]["safe"])
+        self.assertFalse(status["health"]["history_conflicts_clear"])
+        self.assertEqual(status["rollouts"]["divergent_duplicate_ids"], 1)
+
+    def test_confirmed_conflict_isolation_keeps_canonical_and_full_cold_backup(self) -> None:
+        index = json.dumps({"id": self.active_id, "thread_name": "Active"}) + "\n"
+        index_path = self.codex / "session_index.jsonl"
+        index_path.write_text(index, encoding="utf-8")
+        canonical = self.active_path.read_bytes() + b'{"type":"response_item","payload":{"marker":"canonical"}}\n'
+        self.active_path.write_bytes(canonical)
+        duplicate = self.codex / "archived_sessions" / f"duplicate-{self.active_id}.jsonl"
+        branch = (
+            self.active_path.read_bytes().split(b"\n", 1)[0]
+            + b'\n{"type":"response_item","payload":{"marker":"branch"}}\n'
+        )
+        duplicate.write_bytes(branch)
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        before_rows = list(connection.execute("SELECT id, archived, rollout_path, model_provider FROM threads ORDER BY id"))
+        connection.close()
+
+        result = self.service.resolve_history_conflicts(confirmed=True)
+
+        self.assertEqual(result["resolved"], 1)
+        self.assertEqual(result["quarantined_files"], 1)
+        self.assertEqual(self.active_path.read_bytes(), canonical)
+        self.assertFalse(duplicate.exists())
+        quarantine = Path(result["quarantine"]["path"])
+        quarantined = quarantine / "files" / duplicate.relative_to(self.codex)
+        self.assertEqual(quarantined.read_bytes(), branch)
+        cold_backup = Path(result["cold_backup"]["path"])
+        self.assertEqual((cold_backup / "files" / duplicate.relative_to(self.codex)).read_bytes(), branch)
+        self.assertEqual((cold_backup / "files" / self.active_path.relative_to(self.codex)).read_bytes(), canonical)
+        self.assertTrue((cold_backup / "database-logical.sqlite").is_file())
+        self.assertEqual(
+            (cold_backup / "database-raw" / "state_5.sqlite").read_bytes(),
+            (self.codex / "state_5.sqlite").read_bytes(),
+        )
+        self.assertEqual(index_path.read_text(encoding="utf-8"), index)
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        after_rows = list(connection.execute("SELECT id, archived, rollout_path, model_provider FROM threads ORDER BY id"))
+        connection.close()
+        self.assertEqual(after_rows, before_rows)
+        self.assertEqual(self.service.history_conflict_report()["divergent_duplicate_id_count"], 0)
+
+    def test_conflict_isolation_requires_confirmation(self) -> None:
+        before_backups = list(self.service.history_cold_backups_dir.iterdir())
+        before_conflicts = list(self.service.history_conflicts_dir.iterdir())
+
+        with self.assertRaisesRegex(GuardianError, "明确确认"):
+            self.service.resolve_history_conflicts(confirmed=False)
+
+        self.assertEqual(list(self.service.history_cold_backups_dir.iterdir()), before_backups)
+        self.assertEqual(list(self.service.history_conflicts_dir.iterdir()), before_conflicts)
+
+    def test_conflict_isolation_rolls_back_removed_copy_on_verification_failure(self) -> None:
+        self.active_path.write_bytes(
+            self.active_path.read_bytes()
+            + b'{"type":"response_item","payload":{"marker":"canonical"}}\n'
+        )
+        duplicate = self.codex / "archived_sessions" / f"duplicate-{self.active_id}.jsonl"
+        branch = (
+            self.active_path.read_bytes().split(b"\n", 1)[0]
+            + b'\n{"type":"response_item","payload":{"marker":"branch"}}\n'
+        )
+        duplicate.write_bytes(branch)
+        original_inventory = self.service._rollout_inventory
+        call_count = 0
+
+        def fail_second_inventory(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise GuardianError("fixture post-isolation failure")
+            return original_inventory(*args, **kwargs)
+
+        with patch.object(self.service, "_rollout_inventory", side_effect=fail_second_inventory):
+            with self.assertRaisesRegex(GuardianError, "fixture post-isolation failure"):
+                self.service.resolve_history_conflicts(confirmed=True)
+
+        self.assertEqual(duplicate.read_bytes(), branch)
+        self.assertEqual(len(list(self.service.history_cold_backups_dir.iterdir())), 1)
+        quarantine_roots = list(self.service.history_conflicts_dir.iterdir())
+        self.assertEqual(len(quarantine_roots), 1)
+        self.assertTrue((quarantine_roots[0] / "INCOMPLETE.json").is_file())
+
+    def test_conflict_isolation_rolls_back_when_completion_manifest_write_fails(self) -> None:
+        self.active_path.write_bytes(
+            self.active_path.read_bytes()
+            + b'{"type":"response_item","payload":{"marker":"canonical"}}\n'
+        )
+        duplicate = self.codex / "archived_sessions" / f"duplicate-{self.active_id}.jsonl"
+        branch = (
+            self.active_path.read_bytes().split(b"\n", 1)[0]
+            + b'\n{"type":"response_item","payload":{"marker":"branch"}}\n'
+        )
+        duplicate.write_bytes(branch)
+        original_atomic_json = guardian_module.atomic_json
+
+        def fail_complete_manifest(path, payload):
+            if Path(path).name == "manifest.json" and payload.get("state") == "complete":
+                raise GuardianError("fixture completion manifest failure")
+            return original_atomic_json(path, payload)
+
+        with patch.object(guardian_module, "atomic_json", side_effect=fail_complete_manifest):
+            with self.assertRaisesRegex(GuardianError, "fixture completion manifest failure"):
+                self.service.resolve_history_conflicts(confirmed=True)
+
+        self.assertEqual(duplicate.read_bytes(), branch)
+        quarantine_roots = list(self.service.history_conflicts_dir.iterdir())
+        self.assertEqual(len(quarantine_roots), 1)
+        incomplete = json.loads((quarantine_roots[0] / "INCOMPLETE.json").read_text(encoding="utf-8"))
+        self.assertFalse(incomplete["restore_failed"])
 
     def test_switch_rewrites_safe_duplicate_rollouts_without_selecting_or_deleting(self) -> None:
         profile = self.service.create_api_profile(
@@ -1809,16 +2009,15 @@ for line in sys.stdin:
         self.service._update_config = original_method  # type: ignore[method-assign]
         self.assertEqual((self.codex / "config.toml").read_bytes(), original_config)
 
-    def test_auto_close_falls_back_to_force_for_remaining_process_tree(self) -> None:
+    def test_auto_close_never_falls_back_to_force_for_remaining_process_tree(self) -> None:
         self.service.is_fixture = False
-        self.service._codex_related_running = Mock(side_effect=[True, False])  # type: ignore[method-assign]
+        self.service._codex_related_running = Mock(return_value=True)  # type: ignore[method-assign]
         with patch("backend.guardian.subprocess.run") as run, patch(
-            "backend.guardian.time.time", side_effect=[0, 10, 10, 11]
+            "backend.guardian.time.time", side_effect=[0, 10]
         ):
-            self.assertTrue(self.service.request_close_codex())
-        self.assertEqual(run.call_count, 2)
-        graceful = run.call_args_list[0].args[0][-1]
-        forced = run.call_args_list[1].args[0][-1]
+            self.assertFalse(self.service.request_close_codex())
+        self.assertEqual(run.call_count, 1)
+        graceful = run.call_args.args[0][-1]
         self.assertIn("taskkill.exe /PID", graceful)
         self.assertIn("/T", graceful)
         self.assertIn("ChatGPT.exe", graceful)
@@ -1826,8 +2025,6 @@ for line in sys.stdin:
         self.assertIn("resources\\\\codex", graceful)
         self.assertIn("app-server", graceful)
         self.assertNotIn("/F /PID", graceful)
-        self.assertIn("taskkill.exe /F /PID", forced)
-        self.assertIn("/T", forced)
 
     def test_ensure_closed_handles_orphaned_packaged_app_server(self) -> None:
         self.service.is_fixture = False
@@ -1836,7 +2033,7 @@ for line in sys.stdin:
 
         self.service._ensure_codex_closed()
 
-        self.service.request_close_codex.assert_called_once()  # type: ignore[attr-defined]
+        self.service.request_close_codex.assert_called_once_with()  # type: ignore[attr-defined]
 
     def test_launch_uses_new_chatgpt_app_id_and_verifies_process(self) -> None:
         self.service.is_fixture = False

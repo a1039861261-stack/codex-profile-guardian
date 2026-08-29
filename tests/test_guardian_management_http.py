@@ -10,7 +10,7 @@ from unittest.mock import patch
 from zipfile import ZipFile
 
 from backend.failover import FailoverPublishError
-from backend.guardian import GuardianDiagnosticError, GuardianService
+from backend.guardian import GuardianDiagnosticError, GuardianPublicError, GuardianService
 from backend.server import SESSION_COOKIE, start_server
 
 
@@ -421,6 +421,73 @@ class GuardianManagementHttpTests(unittest.TestCase):
             status, _, payload = self._request("POST", "/api/update/install", cookie=cookie, payload={"confirm": True})
         self.assertEqual(status, 200)
         install.assert_called_once_with(confirmed=True)
+
+    def test_history_conflict_routes_are_session_bound_and_require_exact_confirmation(self) -> None:
+        status, _, payload = self._request("GET", "/api/protection/conflicts")
+        self.assertEqual((status, payload["error"]["code"]), (401, "guardian_management_session_required"))
+
+        cookie = self._session()
+        report = {
+            "safe_to_switch": False,
+            "can_isolate": True,
+            "active_turns": {"safe": True, "active_count": 0},
+            "divergent_duplicate_id_count": 1,
+            "conflicts": [{"conflict_ref": "abcdef1234567890", "auto_resolvable": True}],
+        }
+        with patch.object(self.service, "history_conflict_report", return_value=report) as read:
+            status, _, payload = self._request(
+                "GET", "/api/protection/conflicts", cookie=cookie
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"], report)
+        read.assert_called_once_with()
+
+        for body in ({}, {"confirm": False, "extra": True}):
+            with self.subTest(body=body):
+                status, _, payload = self._request(
+                    "POST",
+                    "/api/protection/conflicts/isolate",
+                    cookie=cookie,
+                    payload=body,
+                )
+                self.assertEqual((status, payload["error"]["code"]), (400, "guardian_request_failed"))
+
+        isolated = {"resolved": 1, "quarantined_files": 1}
+        with patch.object(
+            self.service, "resolve_history_conflicts", return_value=isolated
+        ) as resolve:
+            status, _, payload = self._request(
+                "POST",
+                "/api/protection/conflicts/isolate",
+                cookie=cookie,
+                payload={"confirm": True},
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"], isolated)
+        resolve.assert_called_once_with(confirmed=True)
+
+    def test_guardian_public_error_returns_only_bounded_message_and_details(self) -> None:
+        cookie = self._session()
+        public_message = "检测到正在执行的任务，未关闭 Codex，也未修改任何文件。"
+        with patch.object(
+            self.service,
+            "history_conflict_report",
+            side_effect=GuardianPublicError(
+                "codex_active_turn",
+                public_message,
+                details={"active_count": 1},
+                retryable=True,
+            ),
+        ):
+            status, _, payload = self._request(
+                "GET", "/api/protection/conflicts", cookie=cookie
+            )
+
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"]["code"], "codex_active_turn")
+        self.assertEqual(payload["error"]["message"], public_message)
+        self.assertEqual(payload["error"]["details"], {"active_count": 1})
+        self.assertTrue(payload["error"]["retryable"])
 
     def test_claude_desktop_status_and_explicit_actions_use_management_session(self) -> None:
         cookie = self._session()

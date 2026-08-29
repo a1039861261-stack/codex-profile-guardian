@@ -693,7 +693,16 @@ function ClaudeProviderModal({ profile, onClose, onSaved, notify }) {
   );
 }
 
-function Protection({ status, onRepair, busy }) {
+function Protection({
+  status,
+  conflicts,
+  conflictLoading,
+  onRefreshConflicts,
+  onIsolateConflicts,
+  onOpenConflicts,
+  onRepair,
+  busy,
+}) {
   const database = status?.database || {};
   const rollouts = status?.rollouts || {};
   const providerEntries = Object.entries(database.providers || {});
@@ -706,9 +715,52 @@ function Protection({ status, onRepair, busy }) {
       : database.source === "codex_home"
         ? "Codex 默认目录"
         : "尚未定位";
+  const activeTurnCount = conflicts?.active_turns?.active_count || 0;
+  const uncertainTurnCount = conflicts?.active_turns?.uncertain_count || 0;
+  const divergentCount = conflicts?.divergent_duplicate_id_count || 0;
+  const conflictCopies = (conflicts?.conflicts || []).reduce(
+    (total, item) => total + Number(item.copy_count || 0),
+    0,
+  );
   return (
     <div className="page-stack">
       <HealthStrip status={status} />
+      <section className={`content-panel history-conflict-panel ${activeTurnCount || uncertainTurnCount || divergentCount ? "is-warning" : "is-safe"}`}>
+        <div className="history-conflict-icon">
+          {conflictLoading ? <CircleNotch className="spin" weight="bold" /> : activeTurnCount || uncertainTurnCount || divergentCount ? <Warning weight="duotone" /> : <ShieldCheck weight="duotone" />}
+        </div>
+        <div className="history-conflict-copy">
+          <span className="eyebrow">切换前安全检查</span>
+          {conflictLoading ? (
+            <><h2>正在只读核对任务与聊天副本</h2><p>不会读取正文到界面，也不会修改会话文件。</p></>
+          ) : activeTurnCount ? (
+            <><h2>检测到 {activeTurnCount} 个任务仍在执行</h2><p>Guardian 已禁止关闭 Codex 和账号切换。等当前回复完整结束后，再刷新检测。</p></>
+          ) : uncertainTurnCount ? (
+            <><h2>无法确认最近任务是否已经结束</h2><p>Guardian 已按安全规则停止切换。请等待界面停止输出并正常退出 Codex，再刷新检测。</p></>
+          ) : divergentCount ? (
+            <>
+              <h2>发现 {divergentCount} 组同 ID 聊天正文分叉</h2>
+              <p>这不是“归档数量”问题。相同会话 ID 对应了不同正文，反复切换不会自行恢复；当前 Codex 使用的副本可被明确识别时，才能安全隔离其他分支。</p>
+              <div className="conflict-summary">
+                <span>{divergentCount} 组冲突</span>
+                <span>{conflictCopies} 个原始副本</span>
+                <span>{conflicts?.can_isolate ? "可安全隔离" : "需要人工只读核对"}</span>
+              </div>
+            </>
+          ) : conflicts ? (
+            <><h2>未发现正文冲突，当前没有进行中任务</h2><p>账号切换仍会在执行瞬间再次复核；Guardian 不会强制结束 Codex。</p></>
+          ) : (
+            <><h2>尚未执行切换前检查</h2><p>点击刷新，核对进行中任务和同 ID 聊天分支。</p></>
+          )}
+        </div>
+        <div className="history-conflict-actions">
+          <Button icon={ArrowClockwise} loading={conflictLoading} onClick={onRefreshConflicts} disabled={busy || conflictLoading}>刷新检测</Button>
+          {divergentCount ? (
+            <Button tone="primary" icon={Archive} onClick={onIsolateConflicts} disabled={busy || conflictLoading || !conflicts?.can_isolate}>全量冷备并隔离</Button>
+          ) : null}
+          <Button icon={FolderOpen} onClick={onOpenConflicts} disabled={busy}>打开隔离库</Button>
+        </div>
+      </section>
       <div className="protection-grid">
         <section className="content-panel protection-card">
           <header>
@@ -740,7 +792,9 @@ function Protection({ status, onRepair, busy }) {
             {rollouts.invalid ? (
               <div><code>文件结构异常</code><Badge tone="warning">{rollouts.invalid} 项</Badge></div>
             ) : null}
-            {rollouts.duplicate_ids ? (
+            {rollouts.divergent_duplicate_ids ? (
+              <div><code>同 ID 正文冲突</code><Badge tone="warning">{rollouts.divergent_duplicate_ids} 组</Badge></div>
+            ) : rollouts.duplicate_ids ? (
               <div><code>保留的历史重复副本</code><Badge tone="success">{rollouts.duplicate_ids} 组</Badge></div>
             ) : null}
           </div>
@@ -846,8 +900,8 @@ function updateStateCopy(update) {
     downloaded: ["更新已就绪", `v${update?.latest_version || "-"} 已完成 SHA-256 校验`],
     installing: ["安装程序已启动", "安装器将负责升级和失败回滚"],
     error: ["暂时无法检查", update?.error_code === "update_repository_unavailable" ? "当前仓库为私有，匿名客户端无法读取 Release" : "网络、限流或 Release 资料暂不可用"],
-  };
-  return states[update?.state] || states.idle;
+    };
+    return states[update?.state] || states.idle;
 }
 
 function Settings({ status, onSave, onOpen, onRemoteSync, onUpdateCheck, onUpdateDownload, onUpdateInstall, busy }) {
@@ -1098,10 +1152,11 @@ function ConfirmModal({ action, status, onClose, onConfirm, busy }) {
   const isSync = action?.type === "sync";
   const isRemoteSync = action?.type === "remote-sync";
   const isUpdateInstall = action?.type === "update-install";
+  const isSwitch = action?.type === "switch";
   return (
     <Modal
       title={isUpdateInstall ? "安装已经校验的新版本？" : isRestore ? "恢复这个备份？" : isDelete ? "删除这个账号？" : isSync ? `更新 ${profile?.name} 的登录？` : isRemoteSync ? `同步 ${profile?.name} 到 SSH？` : `切换到 ${profile?.name}？`}
-      description={isUpdateInstall ? "将启动版本化安装包；安装器会排空后台网关，并在升级失败时恢复旧版本" : isRestore ? "恢复会回到该时间点的配置与会话索引" : isDelete ? "只删除 Guardian 保存的加密凭据" : isSync ? "将自动关闭 Codex，并读取刚刚重新登录后的最新凭据" : isRemoteSync ? `将写入 ${action?.hostCount || 0} 台已登记 SSH 主机，并让远端 Codex 重新加载配置` : "将自动关闭 Codex 并创建配置与元数据回滚点"}
+      description={isUpdateInstall ? "将启动版本化安装包；安装器会排空后台网关，并在升级失败时恢复旧版本" : isRestore ? "恢复会回到该时间点的配置与会话索引" : isDelete ? "只删除 Guardian 保存的加密凭据" : isSync ? "将自动关闭 Codex，并读取刚刚重新登录后的最新凭据" : isRemoteSync ? `将写入 ${action?.hostCount || 0} 台已登记 SSH 主机，并让远端 Codex 重新加载配置` : "已完成只读预检；只尝试正常关闭 Codex，绝不会强制结束进程"}
       onClose={onClose}
       size="small"
     >
@@ -1124,6 +1179,7 @@ function ConfirmModal({ action, status, onClose, onConfirm, busy }) {
           <><span><CheckCircle weight="fill" /> 远端有活动任务时会拒绝同步</span><span><CheckCircle weight="fill" /> API Key 只通过 SSH 标准输入传输</span><span><CheckCircle weight="fill" /> 每台主机都会返回独立结果</span></>
         ) : (
           <>
+            <span><CheckCircle weight="fill" /> 未检测到进行中任务或正文冲突</span>
             <span><CheckCircle weight="fill" /> 自动备份 auth、config、SQLite 与会话文件</span>
             <span><CheckCircle weight="fill" /> 保持 {status?.database?.archived || 0} 条归档会话状态</span>
             <span><CheckCircle weight="fill" /> Provider 统一失败会自动回滚</span>
@@ -1132,9 +1188,41 @@ function ConfirmModal({ action, status, onClose, onConfirm, busy }) {
       </div>
       <footer className="modal-footer">
         <Button onClick={onClose}>取消</Button>
-        <Button tone={isDelete ? "danger" : "primary"} icon={isDelete ? Trash : ArrowClockwise} loading={busy} onClick={onConfirm} disabled={busy}>
+        <Button tone={isDelete ? "danger" : "primary"} icon={isDelete ? Trash : ArrowClockwise} loading={busy} onClick={onConfirm} disabled={busy || (isSwitch && !action?.preflight?.safe_to_switch)}>
           {isUpdateInstall ? "启动安装" : isRestore ? "确认恢复" : isDelete ? "确认删除" : isSync ? "更新登录" : isRemoteSync ? "同步到 SSH" : "安全切换"}
         </Button>
+      </footer>
+    </Modal>
+  );
+}
+
+function HistoryConflictConfirmModal({ report, onClose, onConfirm, busy }) {
+  const conflictCount = report?.divergent_duplicate_id_count || 0;
+  const copyCount = (report?.conflicts || []).reduce(
+    (total, item) => total + Number(item.copy_count || 0),
+    0,
+  );
+  return (
+    <Modal
+      title={`安全隔离 ${conflictCount} 组聊天冲突？`}
+      description="这是独立的历史修复操作，不会在账号切换时自动执行。"
+      onClose={onClose}
+      size="small"
+    >
+      <div className="confirm-visual"><Archive weight="duotone" /></div>
+      <div className="conflict-confirm-warning">
+        <Warning weight="fill" />
+        <div><strong>先等所有任务完成</strong><p>操作会正常关闭 Codex；如果仍检测到进行中任务或无法安全退出，将立即停止且不修改文件。</p></div>
+      </div>
+      <div className="confirm-list">
+        <span><CheckCircle weight="fill" /> 先完整复制并校验 auth、config、SQLite、索引和全部会话正文</span>
+        <span><CheckCircle weight="fill" /> 保留 SQLite 当前引用的聊天副本，正文、ID、归档状态和索引不变</span>
+        <span><CheckCircle weight="fill" /> 其余 {Math.max(0, copyCount - conflictCount)} 个分支副本移入 Guardian 隔离库并保留哈希</span>
+        <span><CheckCircle weight="fill" /> 任一步验证失败会恢复原路径，冷备与隔离副本继续保留</span>
+      </div>
+      <footer className="modal-footer">
+        <Button onClick={onClose} disabled={busy}>取消</Button>
+        <Button tone="primary" icon={Archive} loading={busy} onClick={onConfirm} disabled={busy || !report?.can_isolate}>确认冷备并隔离</Button>
       </footer>
     </Modal>
   );
@@ -1157,6 +1245,9 @@ export function App() {
   const [claudeRestartOpen, setClaudeRestartOpen] = useState(false);
   const [claudeProfileModal, setClaudeProfileModal] = useState(null);
   const [claudeAction, setClaudeAction] = useState(null);
+  const [conflictReport, setConflictReport] = useState(null);
+  const [conflictLoading, setConflictLoading] = useState(false);
+  const [conflictConfirmOpen, setConflictConfirmOpen] = useState(false);
   const quotaRefreshSignature = useRef("");
   const updatePromptedVersion = useRef("");
 
@@ -1212,6 +1303,20 @@ export function App() {
     }
   }, [notify]);
 
+  const refreshConflicts = useCallback(async ({ silent = false } = {}) => {
+    setConflictLoading(true);
+    try {
+      const report = await api("/api/protection/conflicts");
+      setConflictReport(report);
+      return report;
+    } catch (error) {
+      if (!silent) notify(`切换前检查失败：${error.message}`, "error");
+      return null;
+    } finally {
+      setConflictLoading(false);
+    }
+  }, [notify]);
+
   const refreshUpdateStatus = useCallback(async () => {
     try {
       const update = await api("/api/update");
@@ -1233,11 +1338,12 @@ export function App() {
       }
       const statusOk = await refresh();
       const quotaResult = await refreshOfficialQuotas();
+      if (route === "protection") await refreshConflicts({ silent: true });
       if (statusOk && quotaResult !== null) notify("状态与额度已刷新");
     } finally {
       setRefreshing(false);
     }
-  }, [refreshing, route, refresh, refreshClaude, refreshOfficialQuotas, notify]);
+  }, [refreshing, route, refresh, refreshClaude, refreshOfficialQuotas, refreshConflicts, notify]);
 
   const refreshQuotaNow = useCallback(async () => {
     if (refreshing) return;
@@ -1278,6 +1384,10 @@ export function App() {
   }, [route, refreshClaude]);
 
   useEffect(() => {
+    if (route === "protection") refreshConflicts();
+  }, [route, refreshConflicts]);
+
+  useEffect(() => {
     if (!status) return;
     const signature = (status.profiles || [])
       .filter((profile) => profile.type === "official")
@@ -1305,7 +1415,7 @@ export function App() {
     };
   }, [status?.profiles, refreshOfficialQuotas]);
 
-  const run = async (work, successMessage) => {
+  const run = useCallback(async (work, successMessage) => {
     setBusy(true);
     try {
       const result = await work();
@@ -1318,7 +1428,7 @@ export function App() {
     } finally {
       setBusy(false);
     }
-  };
+  }, [notify, refresh]);
 
   const runClaudeAction = async (work, successMessage) => {
     setBusy(true);
@@ -1373,11 +1483,52 @@ export function App() {
     if (result) setConfirmAction(null);
   };
 
+  const prepareSwitch = useCallback(async (profile) => {
+    const report = await refreshConflicts();
+    if (!report) return;
+    const activeCount = report?.active_turns?.active_count || 0;
+    const uncertainCount = report?.active_turns?.uncertain_count || 0;
+    const conflictCount = report?.divergent_duplicate_id_count || 0;
+    if (activeCount) {
+      setRoute("protection");
+      notify(`检测到 ${activeCount} 个任务仍在执行，Guardian 未关闭 Codex，也未修改任何文件。`, "warning");
+      return;
+    }
+    if (uncertainCount) {
+      setRoute("protection");
+      notify("无法安全确认最近任务是否结束；Guardian 未关闭 Codex，也未修改任何文件。", "warning");
+      return;
+    }
+    if (conflictCount) {
+      setRoute("protection");
+      notify(`检测到 ${conflictCount} 组同 ID 聊天正文分叉；反复切换不会恢复，请先完成全量冷备与隔离。`, "warning");
+      return;
+    }
+    setConfirmAction({ type: "switch", profile, preflight: report });
+  }, [run, refreshConflicts, notify]);
+
+  const isolateConflicts = useCallback(async () => {
+    const result = await run(
+      () => api("/api/protection/conflicts/isolate", {
+        method: "POST",
+        body: JSON.stringify({ confirm: true }),
+      }),
+      null,
+    );
+    if (!result) return;
+    setConflictConfirmOpen(false);
+    await refreshConflicts({ silent: true });
+    notify(
+      `已完成全量冷备，保留当前聊天并隔离 ${result.quarantined_files || 0} 个分支副本。现在可以重新发起账号切换。`,
+      "success",
+    );
+  }, [refreshConflicts, notify]);
+
   const body = useMemo(() => {
     const shared = {
       status,
-      busy,
-      onSwitch: (profile) => setConfirmAction({ type: "switch", profile }),
+      busy: busy || conflictLoading,
+      onSwitch: prepareSwitch,
     };
     if (route === "overview") return <Overview status={status} onOpenAdd={() => setAddOpen(true)} onRefreshQuota={refreshQuotaNow} quotaRefreshing={refreshing} />;
     if (route === "accounts") return (
@@ -1391,7 +1542,7 @@ export function App() {
         onDelete={(profile) => setConfirmAction({ type: "delete", profile })}
       />
     );
-    if (route === "protection") return <Protection status={status} busy={busy} onRepair={async () => {
+    if (route === "protection") return <Protection status={status} conflicts={conflictReport} conflictLoading={conflictLoading} busy={busy} onRefreshConflicts={() => refreshConflicts()} onIsolateConflicts={() => setConflictConfirmOpen(true)} onOpenConflicts={() => run(() => api("/api/open-folder", { method: "POST", body: JSON.stringify({ kind: "history-conflicts" }) }), "隔离库已打开")} onRepair={async () => {
       const result = await run(() => api("/api/protection/repair", { method: "POST", body: "{}" }), null);
       if (!result) return;
       notify(
@@ -1420,7 +1571,7 @@ export function App() {
     if (route === "backups") return <Backups backups={backups} busy={busy} onRestore={(backup) => setConfirmAction({ type: "restore", backup })} onOpen={() => api("/api/open-folder", { method: "POST", body: JSON.stringify({ kind: "backups" }) })} />;
     if (route === "logs") return <Logs logs={logs} busy={busy} onRefresh={refresh} onClear={() => run(() => api("/api/logs/clear", { method: "POST", body: "{}" }), "日志已清空")} />;
     return <Settings status={status} busy={busy} onSave={(settings) => run(() => api("/api/settings", { method: "POST", body: JSON.stringify(settings) }), "设置已保存")} onRemoteSync={async (settings) => { const saved = await run(() => api("/api/settings", { method: "POST", body: JSON.stringify(settings) }), null); if (saved) setConfirmAction({ type: "remote-sync", profile: status?.current_profile, hostCount: status?.remote?.host_count || 0 }); }} onUpdateCheck={() => run(() => api("/api/update/check", { method: "POST", body: "{}" }), "版本检查完成")} onUpdateDownload={() => run(() => api("/api/update/download", { method: "POST", body: "{}" }), "新版安装包已下载并通过校验")} onUpdateInstall={() => setConfirmAction({ type: "update-install" })} onOpen={(kind) => api("/api/open-folder", { method: "POST", body: JSON.stringify({ kind }) })} />;
-  }, [route, status, busy, backups, logs, refresh, refreshQuotaNow, refreshing, claudeStatus, claudeLoading, refreshClaude]);
+  }, [route, status, busy, backups, logs, refresh, refreshQuotaNow, refreshing, claudeStatus, claudeLoading, refreshClaude, conflictReport, conflictLoading, refreshConflicts, prepareSwitch, run, notify]);
 
   if (loading) {
     return <div className="boot-screen"><AppMark /><CircleNotch className="spin" weight="bold" /><span>正在检查本机 AI 客户端…</span></div>;
@@ -1499,6 +1650,7 @@ export function App() {
       {addOpen && <AddProfileModal onClose={() => setAddOpen(false)} onCreated={refresh} notify={notify} />}
       {editProfile && <EditProfileModal profile={editProfile} onClose={() => setEditProfile(null)} onSaved={refresh} onRemoteSyncRequired={(profile, hostCount) => setConfirmAction({ type: "remote-sync", profile, hostCount })} notify={notify} />}
       {confirmAction && <ConfirmModal action={confirmAction} status={status} busy={busy} onClose={() => !busy && setConfirmAction(null)} onConfirm={handleConfirm} />}
+      {conflictConfirmOpen && <HistoryConflictConfirmModal report={conflictReport} busy={busy} onClose={() => !busy && setConflictConfirmOpen(false)} onConfirm={isolateConflicts} />}
       {claudeProfileModal && <ClaudeProviderModal profile={claudeProfileModal.profile} onClose={() => setClaudeProfileModal(null)} onSaved={refreshClaude} notify={notify} />}
       {claudeAction && (
         <Modal

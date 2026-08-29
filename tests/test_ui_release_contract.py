@@ -108,6 +108,12 @@ class UIReleaseContractTests(unittest.TestCase):
         self.assertIn("updatePromptedVersion.current === version", application)
         self.assertIn('setConfirmAction({ type: "update-install", version, automatic: true })', application)
 
+    def test_uncertain_recent_turn_state_blocks_switch_with_a_visible_reason(self) -> None:
+        application = (self.project / "src" / "App.jsx").read_text(encoding="utf-8")
+        self.assertIn("conflicts?.active_turns?.uncertain_count || 0", application)
+        self.assertIn("无法确认最近任务是否已经结束", application)
+        self.assertIn("无法安全确认最近任务是否结束；Guardian 未关闭 Codex，也未修改任何文件。", application)
+
     def test_product_styles_keep_an_eleven_pixel_font_floor(self) -> None:
         pattern = re.compile(r"font(?:-size)?\s*:[^;]*(?<!\d)(?:8|9|10)px")
         for stylesheet_path in (self.project / "src").rglob("*.css"):

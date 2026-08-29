@@ -21,7 +21,13 @@ from .failover import (
     FailoverStoreError,
     FailoverValidationError,
 )
-from .guardian import APP_VERSION, GuardianDiagnosticError, GuardianError, GuardianService
+from .guardian import (
+    APP_VERSION,
+    GuardianDiagnosticError,
+    GuardianError,
+    GuardianPublicError,
+    GuardianService,
+)
 
 
 SESSION_COOKIE = "guardian_session"
@@ -135,15 +141,19 @@ class GuardianHandler(SimpleHTTPRequestHandler):
         message: str,
         *,
         retryable: bool = False,
+        details: dict[str, Any] | None = None,
     ) -> None:
+        error = {
+            "code": code,
+            "message": message,
+            "retryable": retryable,
+        }
+        if details:
+            error["details"] = details
         self._json(
             {
                 "ok": False,
-                "error": {
-                    "code": code,
-                    "message": message,
-                    "retryable": retryable,
-                },
+                "error": error,
             },
             status,
         )
@@ -208,6 +218,14 @@ class GuardianHandler(SimpleHTTPRequestHandler):
             self._error(400, exc.code, "容灾操作失败。")
         elif isinstance(exc, GuardianDiagnosticError):
             self._error(500, "guardian_diagnostics_failed", "脱敏诊断包生成失败。")
+        elif isinstance(exc, GuardianPublicError):
+            self._error(
+                409,
+                exc.code,
+                exc.public_message,
+                retryable=exc.retryable,
+                details=exc.details,
+            )
         elif isinstance(exc, GuardianError):
             self._error(400, "guardian_request_failed", "请求未完成，请检查输入和当前状态。")
         else:
@@ -247,6 +265,8 @@ class GuardianHandler(SimpleHTTPRequestHandler):
                 data = self.service.list_profiles()
             elif path == "/api/backups":
                 data = self.service.list_backups()
+            elif path == "/api/protection/conflicts":
+                data = self.service.history_conflict_report()
             elif path == "/api/logs":
                 data = self.service.logs()
             elif path == "/api/health":
@@ -376,6 +396,12 @@ class GuardianHandler(SimpleHTTPRequestHandler):
                 )
             elif path == "/api/protection/repair":
                 data = self.service.repair_visibility()
+            elif path == "/api/protection/conflicts/isolate":
+                if set(body) != {"confirm"}:
+                    raise GuardianError("聊天冲突隔离参数无效。")
+                data = self.service.resolve_history_conflicts(
+                    confirmed=body.get("confirm") is True
+                )
             elif match := re.fullmatch(r"/api/backups/([^/]+)/restore", path):
                 data = self.service.restore_backup(match.group(1))
             elif path == "/api/settings":

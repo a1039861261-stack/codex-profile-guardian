@@ -269,6 +269,12 @@ class ReleaseInstallTests(unittest.TestCase):
         self.assertNotIn("installer\\build-iexpress.ps1", release)
         self.assertIn('$Shortcut.IconLocation = "$Target,0"', install)
 
+    def test_runtime_installer_hashing_does_not_depend_on_powershell_modules(self) -> None:
+        install = (self.project / "installer" / "install.ps1").read_text(encoding="utf-8")
+        self.assertIn("function Get-Sha256Hex", install)
+        self.assertIn("[System.Security.Cryptography.SHA256]::Create()", install)
+        self.assertNotIn("Get-FileHash", install)
+
     def test_uninstall_drains_gateway_before_deleting_task_and_files(self) -> None:
         source = (self.project / "installer" / "uninstall.ps1").read_text(encoding="utf-8")
         self.assertIn("function Stop-InstalledGateway", source)

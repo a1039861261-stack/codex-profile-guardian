@@ -65,6 +65,23 @@ function Write-Utf8NoBom {
     [System.IO.File]::WriteAllText($Path, $Value, $Encoding)
 }
 
+function Get-Sha256Hex {
+    param([string]$Path)
+    $Stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $Hasher = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return ([System.BitConverter]::ToString($Hasher.ComputeHash($Stream))).Replace("-", "").ToLowerInvariant()
+        }
+        finally {
+            $Hasher.Dispose()
+        }
+    }
+    finally {
+        $Stream.Dispose()
+    }
+}
+
 function Write-Utf8NoBomAtomic {
     param([string]$Path, [string]$Value)
     $Parent = Split-Path -Parent $Path
@@ -263,7 +280,7 @@ function Write-GatewayReleaseManifest {
 
 function Write-GatewayPointer {
     $ManifestPath = Join-Path $GatewayReleaseRoot "manifest.json"
-    $ManifestHash = (Get-FileHash -LiteralPath $ManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $ManifestHash = Get-Sha256Hex -Path $ManifestPath
     $PreviousVersion = $null
     if (Test-Path -LiteralPath $GatewayPointerPath) {
         try {

@@ -445,6 +445,279 @@ class GuardianServiceTests(unittest.TestCase):
         self.assertEqual(report["active_turns"]["active_count"], 0)
         self.assertEqual(report["active_turns"]["interrupted_count"], 1)
 
+    def test_conflict_report_offers_explicit_selection_when_database_path_is_stale(self) -> None:
+        self.active_path.write_bytes(
+            self.active_path.read_bytes()
+            + b'{"type":"response_item","payload":{"marker":"current-branch"}}\n'
+        )
+        duplicate = self.codex / "archived_sessions" / f"duplicate-{self.active_id}.jsonl"
+        duplicate.write_bytes(
+            self.active_path.read_bytes().split(b"\n", 1)[0]
+            + b'\n{"type":"response_item","payload":{"marker":"other-branch"}}\n'
+        )
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        connection.execute(
+            "UPDATE threads SET rollout_path=? WHERE id=?",
+            (str(self.codex / "sessions" / "missing-rollout.jsonl"), self.active_id),
+        )
+        connection.commit()
+        connection.close()
+
+        report = self.service.history_conflict_report()
+
+        self.assertFalse(report["can_isolate"])
+        self.assertTrue(report["can_resolve"])
+        self.assertEqual(report["action_mode"], "selection_required")
+        self.assertEqual(report["manual_selection_count"], 1)
+        self.assertRegex(report["report_revision"], r"^[a-f0-9]{32}$")
+        conflict = report["conflicts"][0]
+        self.assertTrue(conflict["selection_required"])
+        self.assertTrue(conflict["can_select"])
+        self.assertEqual(conflict["resolution_reason"], "database_path_stale")
+        self.assertTrue(all(item["modified_at"] for item in conflict["copies"]))
+        serialized = json.dumps(report, ensure_ascii=False)
+        self.assertNotIn(self.active_id, serialized)
+        self.assertNotIn("current-branch", serialized)
+        self.assertNotIn("other-branch", serialized)
+
+    def test_manual_conflict_selection_repoints_database_and_quarantines_other_copy(self) -> None:
+        index_path = self.codex / "session_index.jsonl"
+        index = json.dumps({"id": self.active_id, "thread_name": "Fixture"}) + "\n"
+        index_path.write_text(index, encoding="utf-8")
+        active_branch = (
+            self.active_path.read_bytes()
+            + b'{"type":"response_item","payload":{"marker":"active-branch"}}\n'
+        )
+        self.active_path.write_bytes(active_branch)
+        duplicate = self.codex / "archived_sessions" / f"duplicate-{self.active_id}.jsonl"
+        archived_branch = (
+            self.active_path.read_bytes().split(b"\n", 1)[0]
+            + b'\n{"type":"response_item","payload":{"marker":"archived-branch"}}\n'
+        )
+        duplicate.write_bytes(archived_branch)
+        stale_path = str(self.codex / "sessions" / "missing-rollout.jsonl")
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        connection.execute(
+            "UPDATE threads SET rollout_path=?, archived=0 WHERE id=?",
+            (stale_path, self.active_id),
+        )
+        connection.commit()
+        connection.close()
+        report = self.service.history_conflict_report()
+        conflict = report["conflicts"][0]
+        archived_copy = next(item for item in conflict["copies"] if item["location"] == "archived")
+
+        result = self.service.resolve_history_conflicts(
+            confirmed=True,
+            report_revision=report["report_revision"],
+            selections=[
+                {
+                    "conflict_ref": conflict["conflict_ref"],
+                    "keep_copy_ref": archived_copy["copy_ref"],
+                }
+            ],
+        )
+
+        self.assertEqual(result["resolution_mode"], "selection_required")
+        self.assertEqual(result["database_rows_repointed"], 1)
+        self.assertFalse(result["database_unchanged"])
+        self.assertTrue(result["all_original_copies_recoverable"])
+        self.assertFalse(self.active_path.exists())
+        self.assertEqual(duplicate.read_bytes(), archived_branch)
+        quarantine = Path(result["quarantine"]["path"])
+        self.assertEqual(
+            (quarantine / "files" / self.active_path.relative_to(self.codex)).read_bytes(),
+            active_branch,
+        )
+        cold_backup = Path(result["cold_backup"]["path"])
+        self.assertEqual(
+            (cold_backup / "files" / self.active_path.relative_to(self.codex)).read_bytes(),
+            active_branch,
+        )
+        self.assertEqual(
+            (cold_backup / "files" / duplicate.relative_to(self.codex)).read_bytes(),
+            archived_branch,
+        )
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        row = connection.execute(
+            "SELECT archived, rollout_path FROM threads WHERE id=?",
+            (self.active_id,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(row, (1, str(duplicate)))
+        self.assertEqual(index_path.read_text(encoding="utf-8"), index)
+        self.assertEqual(self.service.history_conflict_report()["divergent_duplicate_id_count"], 0)
+
+    def test_manual_conflict_selection_rejects_stale_report_before_backup(self) -> None:
+        self.active_path.write_bytes(
+            self.active_path.read_bytes()
+            + b'{"type":"response_item","payload":{"marker":"active-branch"}}\n'
+        )
+        duplicate = self.codex / "archived_sessions" / f"duplicate-{self.active_id}.jsonl"
+        duplicate.write_bytes(
+            self.active_path.read_bytes().split(b"\n", 1)[0]
+            + b'\n{"type":"response_item","payload":{"marker":"archived-branch"}}\n'
+        )
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        connection.execute("UPDATE threads SET rollout_path=NULL WHERE id=?", (self.active_id,))
+        connection.commit()
+        connection.close()
+        report = self.service.history_conflict_report()
+        conflict = report["conflicts"][0]
+        selected = conflict["copies"][0]
+        duplicate.write_bytes(
+            duplicate.read_bytes()
+            + b'{"type":"event_msg","payload":{"marker":"changed-after-report"}}\n'
+        )
+
+        with self.assertRaises(GuardianPublicError) as raised:
+            self.service.resolve_history_conflicts(
+                confirmed=True,
+                report_revision=report["report_revision"],
+                selections=[
+                    {
+                        "conflict_ref": conflict["conflict_ref"],
+                        "keep_copy_ref": selected["copy_ref"],
+                    }
+                ],
+            )
+
+        self.assertEqual(raised.exception.code, "history_conflict_report_stale")
+        self.assertEqual(list(self.service.history_cold_backups_dir.iterdir()), [])
+        self.assertTrue(self.active_path.is_file())
+        self.assertTrue(duplicate.is_file())
+
+    def test_manual_conflict_selection_rolls_back_database_and_files_on_late_failure(self) -> None:
+        active_branch = (
+            self.active_path.read_bytes()
+            + b'{"type":"response_item","payload":{"marker":"active-branch"}}\n'
+        )
+        self.active_path.write_bytes(active_branch)
+        duplicate = self.codex / "archived_sessions" / f"duplicate-{self.active_id}.jsonl"
+        archived_branch = (
+            self.active_path.read_bytes().split(b"\n", 1)[0]
+            + b'\n{"type":"response_item","payload":{"marker":"archived-branch"}}\n'
+        )
+        duplicate.write_bytes(archived_branch)
+        stale_path = str(self.codex / "sessions" / "missing-rollout.jsonl")
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        connection.execute(
+            "UPDATE threads SET rollout_path=?, archived=0 WHERE id=?",
+            (stale_path, self.active_id),
+        )
+        connection.commit()
+        connection.close()
+        report = self.service.history_conflict_report()
+        conflict = report["conflicts"][0]
+        archived_copy = next(item for item in conflict["copies"] if item["location"] == "archived")
+        original_atomic_json = guardian_module.atomic_json
+
+        def fail_complete_manifest(path, payload):
+            if Path(path).name == "manifest.json" and payload.get("state") == "complete":
+                raise GuardianError("fixture late completion failure")
+            return original_atomic_json(path, payload)
+
+        with patch.object(guardian_module, "atomic_json", side_effect=fail_complete_manifest):
+            with self.assertRaisesRegex(GuardianError, "fixture late completion failure"):
+                self.service.resolve_history_conflicts(
+                    confirmed=True,
+                    report_revision=report["report_revision"],
+                    selections=[
+                        {
+                            "conflict_ref": conflict["conflict_ref"],
+                            "keep_copy_ref": archived_copy["copy_ref"],
+                        }
+                    ],
+                )
+
+        self.assertEqual(self.active_path.read_bytes(), active_branch)
+        self.assertEqual(duplicate.read_bytes(), archived_branch)
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        row = connection.execute(
+            "SELECT archived, rollout_path FROM threads WHERE id=?",
+            (self.active_id,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(row, (0, stale_path))
+        quarantine = next(self.service.history_conflicts_dir.iterdir())
+        incomplete = json.loads((quarantine / "INCOMPLETE.json").read_text(encoding="utf-8"))
+        self.assertFalse(incomplete["restore_failed"])
+        self.assertFalse(incomplete["database_restore_failed"])
+
+    def test_missing_database_thread_row_can_use_explicit_recoverable_selection(self) -> None:
+        self.active_path.write_bytes(
+            self.active_path.read_bytes()
+            + b'{"type":"response_item","payload":{"marker":"keep-this"}}\n'
+        )
+        duplicate = self.codex / "archived_sessions" / f"duplicate-{self.active_id}.jsonl"
+        duplicate.write_bytes(
+            self.active_path.read_bytes().split(b"\n", 1)[0]
+            + b'\n{"type":"response_item","payload":{"marker":"other-branch"}}\n'
+        )
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        connection.execute("DELETE FROM threads WHERE id=?", (self.active_id,))
+        connection.commit()
+        connection.close()
+        report = self.service.history_conflict_report()
+        conflict = report["conflicts"][0]
+        active_copy = next(item for item in conflict["copies"] if item["location"] == "active")
+
+        result = self.service.resolve_history_conflicts(
+            confirmed=True,
+            report_revision=report["report_revision"],
+            selections=[
+                {
+                    "conflict_ref": conflict["conflict_ref"],
+                    "keep_copy_ref": active_copy["copy_ref"],
+                }
+            ],
+        )
+
+        self.assertEqual(conflict["resolution_reason"], "database_record_missing")
+        self.assertEqual(result["database_rows_repointed"], 0)
+        self.assertTrue(result["database_unchanged"])
+        self.assertTrue(self.active_path.is_file())
+        self.assertFalse(duplicate.exists())
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        row = connection.execute("SELECT id FROM threads WHERE id=?", (self.active_id,)).fetchone()
+        connection.close()
+        self.assertIsNone(row)
+
+    def test_missing_database_blocks_selection_without_moving_files(self) -> None:
+        self.active_path.write_bytes(
+            self.active_path.read_bytes()
+            + b'{"type":"response_item","payload":{"marker":"keep-this"}}\n'
+        )
+        duplicate = self.codex / "archived_sessions" / f"duplicate-{self.active_id}.jsonl"
+        duplicate.write_bytes(
+            self.active_path.read_bytes().split(b"\n", 1)[0]
+            + b'\n{"type":"response_item","payload":{"marker":"other-branch"}}\n'
+        )
+        (self.codex / "state_5.sqlite").unlink()
+        report = self.service.history_conflict_report()
+        conflict = report["conflicts"][0]
+
+        self.assertFalse(report["database_available"])
+        self.assertFalse(report["can_resolve"])
+        self.assertEqual(report["action_mode"], "blocked")
+        self.assertEqual(conflict["resolution_reason"], "database_unavailable")
+        with self.assertRaises(GuardianPublicError) as raised:
+            self.service.resolve_history_conflicts(
+                confirmed=True,
+                report_revision=report["report_revision"],
+                selections=[
+                    {
+                        "conflict_ref": conflict["conflict_ref"],
+                        "keep_copy_ref": conflict["copies"][0]["copy_ref"],
+                    }
+                ],
+            )
+
+        self.assertEqual(raised.exception.code, "history_conflict_database_unavailable")
+        self.assertTrue(self.active_path.is_file())
+        self.assertTrue(duplicate.is_file())
+        self.assertEqual(list(self.service.history_cold_backups_dir.iterdir()), [])
+
     def test_confirmed_conflict_isolation_keeps_canonical_and_full_cold_backup(self) -> None:
         index = json.dumps({"id": self.active_id, "thread_name": "Active"}) + "\n"
         index_path = self.codex / "session_index.jsonl"

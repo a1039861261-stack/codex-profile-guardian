@@ -397,10 +397,15 @@ class GuardianHandler(SimpleHTTPRequestHandler):
             elif path == "/api/protection/repair":
                 data = self.service.repair_visibility()
             elif path == "/api/protection/conflicts/isolate":
-                if set(body) != {"confirm"}:
+                if (
+                    "confirm" not in body
+                    or not set(body).issubset({"confirm", "report_revision", "selections"})
+                ):
                     raise GuardianError("聊天冲突隔离参数无效。")
                 data = self.service.resolve_history_conflicts(
-                    confirmed=body.get("confirm") is True
+                    confirmed=body.get("confirm") is True,
+                    report_revision=body.get("report_revision"),
+                    selections=body.get("selections"),
                 )
             elif match := re.fullmatch(r"/api/backups/([^/]+)/restore", path):
                 data = self.service.restore_backup(match.group(1))

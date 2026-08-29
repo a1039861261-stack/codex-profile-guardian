@@ -69,6 +69,24 @@ function formatDate(value) {
   }).format(date);
 }
 
+function formatFileSize(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 KB";
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(bytes >= 10 * 1024 * 1024 ? 0 : 1)} MB`;
+}
+
+function conflictReasonText(reason) {
+  const reasons = {
+    archive_state_mismatch: "数据库路径能找到一个副本，但归档状态与文件位置不一致。",
+    database_path_stale: "数据库记录的会话路径已经陈旧，无法据此判断哪一份是当前分支。",
+    database_path_missing: "数据库会话记录没有保存文件路径，无法自动判断当前分支。",
+    database_record_missing: "数据库中没有这条会话记录，Guardian 不会伪造数据库行。",
+    database_unavailable: "尚未定位 Codex 实际使用的 SQLite，当前不能安全处理。",
+  };
+  return reasons[reason] || "现有只读证据不足以自动判断哪一份应该保留。";
+}
+
 function quotaForProfile(profile) {
   return profile?.official_quota || profile?.quota || profile?.rate_limits || null;
 }
@@ -719,11 +737,23 @@ function Protection({
   const interruptedTurnCount = conflicts?.active_turns?.interrupted_count || 0;
   const uncertainTurnCount = conflicts?.active_turns?.uncertain_count || 0;
   const processState = conflicts?.active_turns?.process_state;
+  const turnStateSafe = conflicts?.active_turns?.safe !== false;
+  const conflictDatabaseAvailable = conflicts?.database_available !== false;
   const divergentCount = conflicts?.divergent_duplicate_id_count || 0;
   const conflictCopies = (conflicts?.conflicts || []).reduce(
     (total, item) => total + Number(item.copy_count || 0),
     0,
   );
+  const conflictBlockedLabel = !turnStateSafe
+    ? "等待任务结束"
+    : !conflictDatabaseAvailable
+      ? "缺少 SQLite"
+      : "暂不可处理";
+  const conflictBlockedTitle = !turnStateSafe
+    ? "请先让 Codex 任务完整结束，再刷新检测"
+    : !conflictDatabaseAvailable
+      ? "需要先定位 Codex 实际使用的 SQLite"
+      : "当前只读证据不足，Guardian 已停止处理";
   return (
     <div className="page-stack">
       <HealthStrip status={status} />
@@ -749,11 +779,15 @@ function Protection({
           ) : divergentCount ? (
             <>
               <h2>发现 {divergentCount} 组同 ID 聊天正文分叉</h2>
-              <p>这不是“归档数量”问题。相同会话 ID 对应了不同正文，反复切换不会自行恢复；当前 Codex 使用的副本可被明确识别时，才能安全隔离其他分支。</p>
+              <p>{conflicts?.can_isolate
+                ? "Guardian 已从 SQLite 唯一识别当前副本，可以先完整冷备再隔离其他分支。"
+                : conflicts?.can_resolve
+                  ? "SQLite 无法自动判断当前分支。请在 Guardian 内明确选择要保留的副本；不要再手动删除聊天文件。"
+                  : "当前缺少可验证的 SQLite，Guardian 已停止处理；不要手动删除、改名或移动聊天文件。"}</p>
               <div className="conflict-summary">
                 <span>{divergentCount} 组冲突</span>
                 <span>{conflictCopies} 个原始副本</span>
-                <span>{conflicts?.can_isolate ? "可安全隔离" : "需要人工只读核对"}</span>
+                <span>{conflicts?.can_isolate ? "可自动保留" : conflicts?.can_resolve ? "需选择保留副本" : "缺少 SQLite，已停止"}</span>
                 {interruptedTurnCount ? <span>{interruptedTurnCount} 个已中断任务标记</span> : null}
               </div>
             </>
@@ -772,7 +806,15 @@ function Protection({
         <div className="history-conflict-actions">
           <Button icon={ArrowClockwise} loading={conflictLoading} onClick={onRefreshConflicts} disabled={busy || conflictLoading}>刷新检测</Button>
           {divergentCount ? (
-            <Button tone="primary" icon={Archive} onClick={onIsolateConflicts} disabled={busy || conflictLoading || !conflicts?.can_isolate}>全量冷备并隔离</Button>
+            <Button
+              tone="primary"
+              icon={Archive}
+              onClick={onIsolateConflicts}
+              disabled={busy || conflictLoading || !conflicts?.can_resolve}
+              title={!conflicts?.can_resolve ? conflictBlockedTitle : undefined}
+            >
+              {conflicts?.can_isolate ? "全量冷备并隔离" : conflicts?.can_resolve ? "选择保留副本" : conflictBlockedLabel}
+            </Button>
           ) : null}
           <Button icon={FolderOpen} onClick={onOpenConflicts} disabled={busy}>打开隔离库</Button>
         </div>
@@ -1218,27 +1260,85 @@ function HistoryConflictConfirmModal({ report, onClose, onConfirm, busy }) {
     (total, item) => total + Number(item.copy_count || 0),
     0,
   );
+  const manualConflicts = (report?.conflicts || []).filter((item) => item.selection_required);
+  const [selections, setSelections] = useState({});
+  useEffect(() => setSelections({}), [report?.report_revision]);
+  const selectedCount = manualConflicts.filter((item) => selections[item.conflict_ref]).length;
+  const ready = Boolean(report?.can_resolve) && selectedCount === manualConflicts.length;
+  const confirm = () => onConfirm({
+    report_revision: report?.report_revision,
+    selections: manualConflicts.map((item) => ({
+      conflict_ref: item.conflict_ref,
+      keep_copy_ref: selections[item.conflict_ref],
+    })),
+  });
   return (
     <Modal
-      title={`安全隔离 ${conflictCount} 组聊天冲突？`}
-      description="这是独立的历史修复操作，不会在账号切换时自动执行。"
+      title={manualConflicts.length ? `选择保留 ${conflictCount} 组聊天分支` : `安全隔离 ${conflictCount} 组聊天冲突？`}
+      description={manualConflicts.length ? "Guardian 不会猜测，也不会合并正文；请逐组明确选择一份留在 Codex。" : "这是独立的历史修复操作，不会在账号切换时自动执行。"}
       onClose={onClose}
-      size="small"
+      size={manualConflicts.length ? "wide" : "small"}
     >
-      <div className="confirm-visual"><Archive weight="duotone" /></div>
       <div className="conflict-confirm-warning">
         <Warning weight="fill" />
-        <div><strong>先等所有任务完成</strong><p>操作会正常关闭 Codex；如果仍检测到进行中任务或无法安全退出，将立即停止且不修改文件。</p></div>
+        <div><strong>不要手动删除聊天</strong><p>操作会再次核对任务并正常关闭 Codex；所有原始副本会先进入完整冷备，未选分支只移入可恢复隔离库。</p></div>
       </div>
+      {manualConflicts.length ? (
+        <div className="conflict-selection-list">
+          {manualConflicts.map((conflict, conflictIndex) => (
+            <section className="conflict-selection-group" key={conflict.conflict_ref}>
+              <header>
+                <div><strong>冲突组 {conflictIndex + 1}</strong><p>{conflictReasonText(conflict.resolution_reason)}</p></div>
+                <Badge tone={selections[conflict.conflict_ref] ? "blue" : "warning"}>
+                  {selections[conflict.conflict_ref] ? "已选择" : "必须选择 1 份"}
+                </Badge>
+              </header>
+              <div className="conflict-copy-options">
+                {(conflict.copies || []).map((copy) => {
+                  const selected = selections[conflict.conflict_ref] === copy.copy_ref;
+                  return (
+                    <label className={`conflict-copy-option ${selected ? "is-selected" : ""}`} key={copy.copy_ref}>
+                      <input
+                        type="radio"
+                        name={`conflict-${conflict.conflict_ref}`}
+                        checked={selected}
+                        disabled={busy}
+                        onChange={() => setSelections((current) => ({
+                          ...current,
+                          [conflict.conflict_ref]: copy.copy_ref,
+                        }))}
+                      />
+                      <span className="conflict-copy-choice">
+                        <span className="conflict-copy-heading">
+                          <strong>{copy.label}</strong>
+                          {copy.database_referenced ? <Badge tone="blue">数据库路径指向</Badge> : null}
+                        </span>
+                        <small>
+                          {copy.location === "archived" ? "归档目录" : "当前会话目录"}
+                          {` · 修改于 ${formatDate(copy.modified_at)} · ${formatFileSize(copy.file_bytes)}`}
+                        </small>
+                      </span>
+                    </label>
+                  );
+                })}
+              </div>
+              {!conflict.database_record_present ? <p className="conflict-database-note">数据库没有该会话行；Guardian 不会新增或伪造记录，所选原始文件仍保留在原目录。</p> : null}
+            </section>
+          ))}
+        </div>
+      ) : <div className="confirm-visual"><Archive weight="duotone" /></div>}
       <div className="confirm-list">
         <span><CheckCircle weight="fill" /> 先完整复制并校验 auth、config、SQLite、索引和全部会话正文</span>
-        <span><CheckCircle weight="fill" /> 保留 SQLite 当前引用的聊天副本，正文、ID、归档状态和索引不变</span>
+        <span><CheckCircle weight="fill" /> 保留{manualConflicts.length ? "你明确选择" : " SQLite 当前明确引用"}的聊天副本，正文和会话 ID 不变</span>
+        {manualConflicts.some((item) => item.database_record_present) ? <span><CheckCircle weight="fill" /> 如数据库路径或归档标记陈旧，只对齐所选原始副本，不改标题、正文或 provider</span> : null}
         <span><CheckCircle weight="fill" /> 其余 {Math.max(0, copyCount - conflictCount)} 个分支副本移入 Guardian 隔离库并保留哈希</span>
         <span><CheckCircle weight="fill" /> 任一步验证失败会恢复原路径，冷备与隔离副本继续保留</span>
       </div>
       <footer className="modal-footer">
         <Button onClick={onClose} disabled={busy}>取消</Button>
-        <Button tone="primary" icon={Archive} loading={busy} onClick={onConfirm} disabled={busy || !report?.can_isolate}>确认冷备并隔离</Button>
+        <Button tone="primary" icon={Archive} loading={busy} onClick={confirm} disabled={busy || !ready}>
+          {manualConflicts.length ? selectedCount === manualConflicts.length ? "确认冷备并处理" : `还需选择 ${manualConflicts.length - selectedCount} 组` : "确认冷备并隔离"}
+        </Button>
       </footer>
     </Modal>
   );
@@ -1523,11 +1623,11 @@ export function App() {
     setConfirmAction({ type: "switch", profile, preflight: report });
   }, [run, refreshConflicts, notify]);
 
-  const isolateConflicts = useCallback(async () => {
+  const isolateConflicts = useCallback(async ({ report_revision, selections }) => {
     const result = await run(
       () => api("/api/protection/conflicts/isolate", {
         method: "POST",
-        body: JSON.stringify({ confirm: true }),
+        body: JSON.stringify({ confirm: true, report_revision, selections }),
       }),
       null,
     );
@@ -1535,10 +1635,10 @@ export function App() {
     setConflictConfirmOpen(false);
     await refreshConflicts({ silent: true });
     notify(
-      `已完成全量冷备，保留当前聊天并隔离 ${result.quarantined_files || 0} 个分支副本。现在可以重新发起账号切换。`,
+      `已完成全量冷备，按确认保留聊天并隔离 ${result.quarantined_files || 0} 个分支副本；所有原始副本均可恢复。现在可以重新发起账号切换。`,
       "success",
     );
-  }, [refreshConflicts, notify]);
+  }, [run, refreshConflicts, notify]);
 
   const body = useMemo(() => {
     const shared = {

@@ -44,7 +44,7 @@ class UIReleaseContractTests(unittest.TestCase):
             stylesheet,
         )
         self.assertIn(
-            ".app-shell.is-gray .button-primary:disabled { color: #ffffff; border-color: #3f5f8f; background: #4b6f9f; opacity: 1; }",
+            ".app-shell.is-gray .button-primary:disabled { color: #737982; border-color: #cfd4da; background: #e7e9ec; opacity: 1; }",
             stylesheet,
         )
         self.assertIn(".app-shell.is-gray .quick-profile.is-current {", stylesheet)
@@ -121,6 +121,21 @@ class UIReleaseContractTests(unittest.TestCase):
         self.assertIn("未收尾标记已归类为中断记录，不再阻止切换", application)
         self.assertIn("无法确认 Codex 后台进程状态", application)
         self.assertIn("后台 app-server 或 CLI 写入进程仍可能继续任务", application)
+
+    def test_history_conflicts_support_explicit_recoverable_copy_selection(self) -> None:
+        application = (self.project / "src" / "App.jsx").read_text(encoding="utf-8")
+        stylesheet = (self.project / "src" / "styles.css").read_text(encoding="utf-8")
+        self.assertIn("conflicts?.can_resolve", application)
+        self.assertIn("选择保留副本", application)
+        self.assertIn("manualConflicts.map((conflict, conflictIndex)", application)
+        self.assertIn("report_revision: report?.report_revision", application)
+        self.assertIn("keep_copy_ref: selections[item.conflict_ref]", application)
+        self.assertIn("不要手动删除聊天", application)
+        self.assertIn('conflictBlockedLabel = !turnStateSafe', application)
+        self.assertIn('"等待任务结束"', application)
+        self.assertIn("所有原始副本均可恢复", application)
+        self.assertIn(".conflict-copy-option.is-selected", stylesheet)
+        self.assertIn(".conflict-copy-options { grid-template-columns: 1fr; }", stylesheet)
 
     def test_product_styles_keep_an_eleven_pixel_font_floor(self) -> None:
         pattern = re.compile(r"font(?:-size)?\s*:[^;]*(?<!\d)(?:8|9|10)px")

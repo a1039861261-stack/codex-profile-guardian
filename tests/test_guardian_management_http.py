@@ -464,7 +464,38 @@ class GuardianManagementHttpTests(unittest.TestCase):
             )
         self.assertEqual(status, 200)
         self.assertEqual(payload["data"], isolated)
-        resolve.assert_called_once_with(confirmed=True)
+        resolve.assert_called_once_with(
+            confirmed=True,
+            report_revision=None,
+            selections=None,
+        )
+
+        selection_payload = {
+            "confirm": True,
+            "report_revision": "a" * 32,
+            "selections": [
+                {
+                    "conflict_ref": "b" * 16,
+                    "keep_copy_ref": "c" * 16,
+                }
+            ],
+        }
+        with patch.object(
+            self.service, "resolve_history_conflicts", return_value=isolated
+        ) as resolve:
+            status, _, payload = self._request(
+                "POST",
+                "/api/protection/conflicts/isolate",
+                cookie=cookie,
+                payload=selection_payload,
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"], isolated)
+        resolve.assert_called_once_with(
+            confirmed=True,
+            report_revision="a" * 32,
+            selections=selection_payload["selections"],
+        )
 
     def test_guardian_public_error_returns_only_bounded_message_and_details(self) -> None:
         cookie = self._session()

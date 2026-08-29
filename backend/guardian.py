@@ -48,7 +48,7 @@ from gateway.protocols.responses import normalize_protocol_compatibility
 
 
 APP_NAME = "Codex Profile Guardian"
-APP_VERSION = "1.10.2"
+APP_VERSION = "1.10.3"
 SCHEMA_VERSION = 1
 MANAGED_START = "# BEGIN CODEX PROFILE GUARDIAN MANAGED"
 MANAGED_END = "# END CODEX PROFILE GUARDIAN MANAGED"
@@ -3387,30 +3387,44 @@ class GuardianService:
             references[str(thread_id_raw)] = {
                 "path": resolved_path,
                 "archived": bool(int(archived_raw or 0)),
+                "raw_path": None if rollout_path_raw is None else str(rollout_path_raw),
+                "raw_archived": None if archived_raw is None else int(archived_raw),
             }
         return references
 
-    def history_conflict_report(self) -> dict[str, Any]:
-        inventory = self._rollout_inventory(refuse_divergent=False)
-        references = self._database_rollout_references()
+    def _history_conflict_copy_ref(self, conflict_ref: str, item: dict[str, Any]) -> str:
+        path = Path(item["path"])
+        relative = path.relative_to(self.codex_home)
+        return hashlib.sha256(
+            (
+                conflict_ref
+                + "\0"
+                + str(relative).lower()
+                + "\0"
+                + str(item["body_sha256"])
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+
+    def _history_conflict_report_from(
+        self,
+        inventory: dict[str, Any],
+        references: dict[str, dict[str, Any]],
+        active_turns: dict[str, Any],
+    ) -> dict[str, Any]:
         conflicts = []
+        revision_conflicts = []
+        database_available = self._state_database_path().is_file()
         for conflict in inventory["divergent_conflicts"]:
             reference = references.get(conflict["thread_id"])
             public_copies = []
             recommended_refs = []
+            database_path_refs = []
             for index, item in enumerate(conflict["copies"], start=1):
                 path = Path(item["path"])
-                relative = path.relative_to(self.codex_home)
-                copy_ref = hashlib.sha256(
-                    (
-                        conflict["conflict_ref"]
-                        + "\0"
-                        + str(relative).lower()
-                        + "\0"
-                        + str(item["body_sha256"])
-                    ).encode("utf-8")
-                ).hexdigest()[:16]
+                copy_ref = self._history_conflict_copy_ref(conflict["conflict_ref"], item)
                 database_referenced = bool(reference and reference["path"] == path)
+                if database_referenced:
+                    database_path_refs.append(copy_ref)
                 archive_matches = bool(
                     reference is not None and reference["archived"] == bool(item["archived"])
                 )
@@ -3423,28 +3437,103 @@ class GuardianService:
                         "label": f"副本 {index}",
                         "location": "archived" if item["archived"] else "active",
                         "file_bytes": int(item["file_bytes"]),
+                        "body_bytes": int(item["body_bytes"]),
                         "body_sha256": str(item["body_sha256"]),
                         "mtime_ns": int(item["mtime_ns"]),
+                        "modified_at": dt.datetime.fromtimestamp(
+                            int(item["mtime_ns"]) / 1_000_000_000,
+                            tz=dt.timezone.utc,
+                        ).isoformat(),
                         "database_referenced": database_referenced,
                         "archive_matches": archive_matches,
                         "recommended": recommended,
                     }
                 )
+            auto_resolvable = len(recommended_refs) == 1
+            if auto_resolvable:
+                resolution_reason = "database_reference_exact"
+            elif not database_available:
+                resolution_reason = "database_unavailable"
+            elif reference is None:
+                resolution_reason = "database_record_missing"
+            elif reference["path"] is None:
+                resolution_reason = "database_path_missing"
+            elif database_path_refs:
+                resolution_reason = "archive_state_mismatch"
+            else:
+                resolution_reason = "database_path_stale"
+            can_select = database_available and len(public_copies) >= 2
             conflicts.append(
                 {
                     "conflict_ref": conflict["conflict_ref"],
                     "copy_count": len(public_copies),
-                    "auto_resolvable": len(recommended_refs) == 1,
-                    "recommended_copy_ref": recommended_refs[0] if len(recommended_refs) == 1 else None,
+                    "auto_resolvable": auto_resolvable,
+                    "selection_required": not auto_resolvable,
+                    "can_select": can_select,
+                    "resolution_reason": resolution_reason,
+                    "database_record_present": reference is not None,
+                    "database_path_copy_ref": database_path_refs[0] if len(database_path_refs) == 1 else None,
+                    "recommended_copy_ref": recommended_refs[0] if auto_resolvable else None,
                     "copies": public_copies,
                 }
             )
-        active_turns = self.active_turn_status()
+            reference_token = None
+            if reference is not None:
+                reference_token = hashlib.sha256(
+                    (
+                        str(reference.get("path") or "")
+                        + "\0"
+                        + str(reference.get("raw_path") or "")
+                        + "\0"
+                        + str(reference.get("raw_archived"))
+                    ).encode("utf-8")
+                ).hexdigest()[:16]
+            revision_conflicts.append(
+                {
+                    "conflict_ref": conflict["conflict_ref"],
+                    "reference_token": reference_token,
+                    "resolution_reason": resolution_reason,
+                    "copies": [
+                        {
+                            "copy_ref": item["copy_ref"],
+                            "location": item["location"],
+                            "file_bytes": item["file_bytes"],
+                            "mtime_ns": item["mtime_ns"],
+                        }
+                        for item in public_copies
+                    ],
+                }
+            )
+        report_revision = hashlib.sha256(
+            json.dumps(
+                revision_conflicts,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        automatic = bool(conflicts) and all(conflict["auto_resolvable"] for conflict in conflicts)
+        selectable = bool(conflicts) and all(
+            conflict["auto_resolvable"] or conflict["can_select"] for conflict in conflicts
+        )
+        if not conflicts:
+            action_mode = "none"
+        elif automatic:
+            action_mode = "automatic"
+        elif selectable:
+            action_mode = "selection_required"
+        else:
+            action_mode = "blocked"
         return {
             "safe_to_switch": active_turns["safe"] and not conflicts,
-            "can_isolate": bool(conflicts)
-            and active_turns["safe"]
-            and all(conflict["auto_resolvable"] for conflict in conflicts),
+            "can_isolate": automatic and active_turns["safe"],
+            "can_resolve": selectable and active_turns["safe"],
+            "action_mode": action_mode,
+            "manual_selection_count": sum(
+                1 for conflict in conflicts if conflict["selection_required"]
+            ),
+            "report_revision": report_revision,
+            "database_available": database_available,
             "active_turns": active_turns,
             "rollout_file_count": len(inventory["entries"]),
             "duplicate_id_count": int(inventory["duplicate_ids"]),
@@ -3453,10 +3542,43 @@ class GuardianService:
             "conflicts": conflicts,
         }
 
-    def resolve_history_conflicts(self, *, confirmed: bool) -> dict[str, Any]:
-        """Keep the SQLite-referenced copy and move divergent orphan copies to a verified vault."""
+    def history_conflict_report(self) -> dict[str, Any]:
+        inventory = self._rollout_inventory(refuse_divergent=False)
+        references = self._database_rollout_references()
+        return self._history_conflict_report_from(
+            inventory,
+            references,
+            self.active_turn_status(),
+        )
+
+    def resolve_history_conflicts(
+        self,
+        *,
+        confirmed: bool,
+        report_revision: str | None = None,
+        selections: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Cold-back up every copy, keep an explicit canonical copy, and quarantine the rest."""
         if not confirmed:
             raise GuardianError("聊天冲突隔离需要明确确认。")
+        selection_map: dict[str, str] = {}
+        if selections is not None:
+            if not isinstance(selections, list) or len(selections) > 256:
+                raise GuardianError("聊天冲突副本选择参数无效。")
+            for selection in selections:
+                if not isinstance(selection, dict) or set(selection) != {"conflict_ref", "keep_copy_ref"}:
+                    raise GuardianError("聊天冲突副本选择参数无效。")
+                conflict_ref = selection.get("conflict_ref")
+                keep_copy_ref = selection.get("keep_copy_ref")
+                if (
+                    not isinstance(conflict_ref, str)
+                    or not isinstance(keep_copy_ref, str)
+                    or re.fullmatch(r"[a-f0-9]{16}", conflict_ref) is None
+                    or re.fullmatch(r"[a-f0-9]{16}", keep_copy_ref) is None
+                    or conflict_ref in selection_map
+                ):
+                    raise GuardianError("聊天冲突副本选择参数无效。")
+                selection_map[conflict_ref] = keep_copy_ref
         with self.lock:
             self._ensure_codex_closed()
             inventory = self._rollout_inventory(refuse_divergent=False)
@@ -3468,23 +3590,87 @@ class GuardianService:
                     "message": "未发现需要隔离的正文分叉。",
                 }
             references = self._database_rollout_references()
+            current_report = self._history_conflict_report_from(
+                inventory,
+                references,
+                self.active_turn_status(),
+            )
+            if not current_report["active_turns"]["safe"]:
+                raise GuardianPublicError(
+                    "codex_active_turn",
+                    "聊天冲突处理前检测到 Codex 任务状态变化。Guardian 未修改任何文件，请结束任务后重新检测。",
+                    retryable=True,
+                )
+            manual_refs = {
+                item["conflict_ref"]
+                for item in current_report["conflicts"]
+                if item["selection_required"]
+            }
+            unselectable_count = sum(
+                1
+                for item in current_report["conflicts"]
+                if item["selection_required"] and not item["can_select"]
+            )
+            if unselectable_count:
+                raise GuardianPublicError(
+                    "history_conflict_database_unavailable",
+                    "未找到 Codex 实际使用的 SQLite，无法安全确认处理结果。Guardian 未移动任何文件。",
+                    details={"blocked_conflict_count": unselectable_count},
+                    retryable=True,
+                )
+            if report_revision is not None and (
+                not isinstance(report_revision, str)
+                or re.fullmatch(r"[a-f0-9]{32}", report_revision) is None
+            ):
+                raise GuardianError("聊天冲突检测版本参数无效。")
+            if manual_refs:
+                if report_revision != current_report["report_revision"]:
+                    raise GuardianPublicError(
+                        "history_conflict_report_stale",
+                        "聊天副本状态已变化。Guardian 未移动任何文件，请刷新检测后重新选择。",
+                        details={"refresh_required": True},
+                        retryable=True,
+                    )
+                if set(selection_map) != manual_refs:
+                    raise GuardianPublicError(
+                        "history_conflict_selection_required",
+                        "请为每一组无法自动识别的聊天分叉明确选择要保留的副本。Guardian 未移动任何文件。",
+                        details={"selection_required_count": len(manual_refs)},
+                    )
+            elif selection_map:
+                raise GuardianError("当前聊天冲突不需要人工选择副本。")
+            elif report_revision is not None and report_revision != current_report["report_revision"]:
+                raise GuardianPublicError(
+                    "history_conflict_report_stale",
+                    "聊天副本状态已变化。Guardian 未移动任何文件，请刷新检测后重试。",
+                    details={"refresh_required": True},
+                    retryable=True,
+                )
+            public_conflicts = {
+                item["conflict_ref"]: item for item in current_report["conflicts"]
+            }
             plan = []
             for conflict in conflicts:
                 reference = references.get(conflict["thread_id"])
-                canonical = [
-                    item
+                public_conflict = public_conflicts[conflict["conflict_ref"]]
+                keep_copy_ref = (
+                    public_conflict["recommended_copy_ref"]
+                    if public_conflict["auto_resolvable"]
+                    else selection_map[conflict["conflict_ref"]]
+                )
+                copies_by_ref = {
+                    self._history_conflict_copy_ref(conflict["conflict_ref"], item): item
                     for item in conflict["copies"]
-                    if reference
-                    and reference["path"] == Path(item["path"])
-                    and reference["archived"] == bool(item["archived"])
-                ]
-                if len(canonical) != 1:
+                }
+                canonical = copies_by_ref.get(keep_copy_ref)
+                if canonical is None:
                     raise GuardianPublicError(
-                        "history_conflict_manual_review_required",
-                        "存在无法自动确认当前版本的聊天冲突。Guardian 未移动任何文件；请保留现场并联系支持进行只读核对。",
-                        details={"manual_review_count": 1},
+                        "history_conflict_report_stale",
+                        "所选聊天副本已变化。Guardian 未移动任何文件，请刷新检测后重新选择。",
+                        details={"refresh_required": True},
+                        retryable=True,
                     )
-                canonical_path = Path(canonical[0]["path"])
+                canonical_path = Path(canonical["path"])
                 other_paths = [
                     Path(item["path"])
                     for item in conflict["copies"]
@@ -3495,6 +3681,22 @@ class GuardianService:
                         "conflict_ref": conflict["conflict_ref"],
                         "canonical": canonical_path,
                         "others": other_paths,
+                        "manual_selection": not public_conflict["auto_resolvable"],
+                        "database_change": (
+                            None
+                            if reference is None
+                            or (
+                                reference["path"] == canonical_path
+                                and reference["archived"] == bool(canonical["archived"])
+                            )
+                            else {
+                                "thread_id": conflict["thread_id"],
+                                "before_path": reference["raw_path"],
+                                "before_archived": reference["raw_archived"],
+                                "after_path": str(canonical_path),
+                                "after_archived": int(bool(canonical["archived"])),
+                            }
+                        ),
                     }
                 )
 
@@ -3507,16 +3709,43 @@ class GuardianService:
             db = Path(self._state_database_location()["path"])
             connection = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=5)
             try:
-                before_rows = list(
+                thread_columns = [
+                    str(row[1]) for row in connection.execute("PRAGMA table_info(threads)")
+                ]
+                required_columns = {"id", "archived", "rollout_path", "model_provider"}
+                if not required_columns.issubset(thread_columns):
+                    raise GuardianError("聊天冲突隔离前 SQLite threads 结构不兼容。")
+                thread_trigger_count = int(
                     connection.execute(
-                        "SELECT id, archived, rollout_path, model_provider FROM threads ORDER BY id"
-                    )
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name='threads'"
+                    ).fetchone()[0]
+                )
+                if thread_trigger_count:
+                    raise GuardianError("聊天冲突隔离前发现 threads 触发器，已停止自动处理。")
+                before_rows = list(
+                    connection.execute("SELECT * FROM threads ORDER BY id")
                 )
                 before_integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
             finally:
                 connection.close()
             if before_integrity != "ok":
                 raise GuardianError("聊天冲突隔离前 SQLite 完整性检查失败。")
+
+            database_changes = [
+                item["database_change"] for item in plan if item["database_change"] is not None
+            ]
+            changes_by_id = {item["thread_id"]: item for item in database_changes}
+            id_index = thread_columns.index("id")
+            archived_index = thread_columns.index("archived")
+            rollout_path_index = thread_columns.index("rollout_path")
+            expected_rows = []
+            for row in before_rows:
+                expected = list(row)
+                change = changes_by_id.get(str(row[id_index]))
+                if change is not None:
+                    expected[archived_index] = change["after_archived"]
+                    expected[rollout_path_index] = change["after_path"]
+                expected_rows.append(tuple(expected))
 
             planned_others = {
                 path.resolve()
@@ -3534,6 +3763,7 @@ class GuardianService:
             }
             copied: list[dict[str, Any]] = []
             removed: list[tuple[Path, Path, str]] = []
+            database_committed = False
             try:
                 active_root = (self.codex_home / "sessions").resolve()
                 archived_root = (self.codex_home / "archived_sessions").resolve()
@@ -3565,6 +3795,10 @@ class GuardianService:
                         "state": "prepared",
                         "cold_backup": cold_backup["name"],
                         "conflict_count": len(plan),
+                        "manual_selection_count": sum(
+                            1 for item in plan if item["manual_selection"]
+                        ),
+                        "database_rows_repointed": len(database_changes),
                         "files": copied,
                     },
                 )
@@ -3572,6 +3806,35 @@ class GuardianService:
                     if sha256(source) != expected_hash:
                         raise GuardianError("聊天冲突源文件在隔离前发生变化，已停止处理。")
                     source.unlink()
+
+                if database_changes:
+                    connection = sqlite3.connect(db, timeout=30)
+                    connection.execute("PRAGMA busy_timeout=30000")
+                    try:
+                        connection.execute("BEGIN IMMEDIATE")
+                        for change in database_changes:
+                            updated = connection.execute(
+                                "UPDATE threads SET archived=?, rollout_path=? "
+                                "WHERE id=? AND archived IS ? AND rollout_path IS ?",
+                                (
+                                    change["after_archived"],
+                                    change["after_path"],
+                                    change["thread_id"],
+                                    change["before_archived"],
+                                    change["before_path"],
+                                ),
+                            ).rowcount
+                            if updated != 1:
+                                raise GuardianError("聊天冲突处理前 SQLite 引用发生变化，已停止处理。")
+                        if str(connection.execute("PRAGMA integrity_check").fetchone()[0]) != "ok":
+                            raise GuardianError("聊天冲突处理时 SQLite 完整性检查失败。")
+                        connection.commit()
+                        database_committed = True
+                    except Exception:
+                        connection.rollback()
+                        raise
+                    finally:
+                        connection.close()
 
                 after_inventory = self._rollout_inventory(refuse_divergent=False)
                 if after_inventory["divergent_duplicate_ids"]:
@@ -3588,15 +3851,13 @@ class GuardianService:
                 connection = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=5)
                 try:
                     after_rows = list(
-                        connection.execute(
-                            "SELECT id, archived, rollout_path, model_provider FROM threads ORDER BY id"
-                        )
+                        connection.execute("SELECT * FROM threads ORDER BY id")
                     )
                     after_integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
                 finally:
                     connection.close()
-                if after_integrity != "ok" or after_rows != before_rows:
-                    raise GuardianError("聊天冲突隔离后 SQLite 状态变化，已停止处理。")
+                if after_integrity != "ok" or after_rows != expected_rows:
+                    raise GuardianError("聊天冲突隔离后 SQLite 状态与选择结果不一致，已停止处理。")
                 if (sha256(index_path) if index_path.is_file() else None) != index_hash:
                     raise GuardianError("聊天冲突隔离后会话索引发生变化，已停止处理。")
                 manifest_path = quarantine_root / "manifest.json"
@@ -3616,12 +3877,51 @@ class GuardianService:
                             restore_failed = True
                     except Exception:
                         restore_failed = True
+                database_restore_failed = False
+                if database_committed:
+                    try:
+                        connection = sqlite3.connect(db, timeout=30)
+                        connection.execute("PRAGMA busy_timeout=30000")
+                        try:
+                            connection.execute("BEGIN IMMEDIATE")
+                            for change in reversed(database_changes):
+                                restored = connection.execute(
+                                    "UPDATE threads SET archived=?, rollout_path=? "
+                                    "WHERE id=? AND archived IS ? AND rollout_path IS ?",
+                                    (
+                                        change["before_archived"],
+                                        change["before_path"],
+                                        change["thread_id"],
+                                        change["after_archived"],
+                                        change["after_path"],
+                                    ),
+                                ).rowcount
+                                if restored != 1:
+                                    raise GuardianError("SQLite 引用自动恢复条件不匹配。")
+                            restored_rows = list(
+                                connection.execute("SELECT * FROM threads ORDER BY id")
+                            )
+                            restored_integrity = str(
+                                connection.execute("PRAGMA integrity_check").fetchone()[0]
+                            )
+                            if restored_rows != before_rows or restored_integrity != "ok":
+                                raise GuardianError("SQLite 引用自动恢复复核失败。")
+                            connection.commit()
+                        except Exception:
+                            connection.rollback()
+                            raise
+                        finally:
+                            connection.close()
+                    except Exception:
+                        database_restore_failed = True
+                        restore_failed = True
                 atomic_json(
                     quarantine_root / "INCOMPLETE.json",
                     {
                         "created_at": utc_now(),
                         "error_type": type(exc).__name__,
                         "restore_failed": restore_failed,
+                        "database_restore_failed": database_restore_failed,
                         "cold_backup": cold_backup["name"],
                     },
                 )
@@ -3630,6 +3930,7 @@ class GuardianService:
                     "error",
                     "聊天冲突隔离失败，已尝试恢复原路径；完整冷备和隔离副本均已保留",
                     restore_failed=restore_failed,
+                    database_restore_failed=database_restore_failed,
                     cold_backup=cold_backup["name"],
                 )
                 if restore_failed:
@@ -3639,8 +3940,10 @@ class GuardianService:
             self._log(
                 "history.conflict_isolate",
                 "success",
-                f"已保留当前 Codex 使用版本，并隔离 {len(removed)} 个正文分支副本",
+                f"已按明确选择保留聊天副本，并隔离 {len(removed)} 个正文分支副本",
                 conflict_count=len(plan),
+                manual_selection_count=sum(1 for item in plan if item["manual_selection"]),
+                database_rows_repointed=len(database_changes),
                 quarantined_files=len(removed),
                 cold_backup=cold_backup["name"],
                 quarantine=quarantine_root.name,
@@ -3653,10 +3956,17 @@ class GuardianService:
                     "name": quarantine_root.name,
                     "path": str(quarantine_root),
                 },
-                "database_unchanged": True,
+                "database_unchanged": not database_changes,
+                "database_rows_repointed": len(database_changes),
                 "index_unchanged": True,
                 "canonical_files_unchanged": True,
                 "preserved_rollout_files_unchanged": True,
+                "all_original_copies_recoverable": True,
+                "resolution_mode": (
+                    "selection_required"
+                    if any(item["manual_selection"] for item in plan)
+                    else "automatic"
+                ),
             }
 
     def _validate_rollout_inventory(

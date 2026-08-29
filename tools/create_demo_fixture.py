@@ -29,6 +29,11 @@ def auth_payload(account: str, refresh: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
+    parser.add_argument(
+        "--manual-history-conflict",
+        action="store_true",
+        help="Create one synthetic divergent thread whose SQLite path is stale for UI acceptance.",
+    )
     args = parser.parse_args()
     root = Path(args.root).resolve()
     if root.exists():
@@ -49,6 +54,8 @@ def main() -> int:
         "source TEXT, model_provider TEXT, cwd TEXT, title TEXT, first_user_message TEXT, has_user_event INTEGER, "
         "archived INTEGER, created_at_ms INTEGER)"
     )
+    first_thread_id = ""
+    first_thread_path: Path | None = None
     for index in range(19):
         thread_id = f"019f330a-e611-70a2-8b98-{index:012d}"
         is_archived = index >= 14
@@ -57,6 +64,9 @@ def main() -> int:
             json.dumps({"type": "session_meta", "payload": {"id": thread_id, "model_provider": "openai"}}) + "\n",
             encoding="utf-8",
         )
+        if index == 0:
+            first_thread_id = thread_id
+            first_thread_path = path
         db.execute(
             "INSERT INTO threads VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
@@ -73,6 +83,46 @@ def main() -> int:
                 1 if is_archived else 0,
                 index,
             ),
+        )
+    if args.manual_history_conflict:
+        assert first_thread_path is not None and first_thread_id
+        first_line = first_thread_path.read_text(encoding="utf-8").splitlines()[0]
+        first_thread_path.write_text(
+            first_line
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-08-29T05:12:00Z",
+                    "payload": {
+                        "role": "assistant",
+                        "content": "synthetic-current-branch-" + ("x" * 4096),
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        duplicate = archived / f"duplicate-{first_thread_id}.jsonl"
+        duplicate.write_text(
+            first_line
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-08-29T04:48:00Z",
+                    "payload": {
+                        "role": "assistant",
+                        "content": "synthetic-other-branch-" + ("y" * 1024),
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        db.execute(
+            "UPDATE threads SET rollout_path=? WHERE id=?",
+            (str(codex / "sessions" / "stale-synthetic-rollout.jsonl"), first_thread_id),
         )
     db.commit()
     db.close()

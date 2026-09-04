@@ -122,6 +122,12 @@ class UIReleaseContractTests(unittest.TestCase):
         self.assertIn("无法确认 Codex 后台进程状态", application)
         self.assertIn("后台 app-server 或 CLI 写入进程仍可能继续任务", application)
 
+    def test_missing_rollout_switch_result_is_a_visible_warning(self) -> None:
+        application = (self.project / "src" / "App.jsx").read_text(encoding="utf-8")
+        self.assertIn("result.migration?.missing_rollout_file_count || 0", application)
+        self.assertIn("条会话仅剩 SQLite 元数据，未重建已缺失的聊天文件", application)
+        self.assertIn('verification?.verified && !missingRollouts ? "success" : "warning"', application)
+
     def test_history_conflicts_support_explicit_recoverable_copy_selection(self) -> None:
         application = (self.project / "src" / "App.jsx").read_text(encoding="utf-8")
         stylesheet = (self.project / "src" / "styles.css").read_text(encoding="utf-8")

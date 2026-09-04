@@ -259,6 +259,117 @@ class GuardianServiceTests(unittest.TestCase):
         self.assertEqual({row[2] for row in rows}, {profile["provider_id"]})
         self.assertEqual({row[0]: row[1] for row in rows}, {self.active_id: 0, self.archived_id: 1})
 
+    def test_switch_tolerates_manually_deleted_rollout_without_recreating_chat_body(self) -> None:
+        profile = self.service.create_api_profile(
+            "Fixture API", "http://127.0.0.1:8317/v1", "secret-key", "gpt-test"
+        )
+        index_path = self.codex / "session_index.jsonl"
+        index_path.write_text(
+            json.dumps({"id": self.active_id, "thread_name": "Deleted locally"}) + "\n",
+            encoding="utf-8",
+        )
+        index_before = index_path.read_bytes()
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        database_before = connection.execute(
+            "SELECT id, rollout_path, title, first_user_message, archived FROM threads WHERE id=?",
+            (self.active_id,),
+        ).fetchone()
+        connection.close()
+        self.active_path.unlink()
+
+        migration = self.service.switch_profile(profile["id"])["migration"]
+
+        self.assertEqual(migration["missing_rollout_file_count"], 1)
+        self.assertEqual(migration["missing_active_rollout_file_count"], 1)
+        self.assertEqual(migration["missing_archived_rollout_file_count"], 0)
+        self.assertEqual(migration["stale_rollout_path_count"], 1)
+        self.assertFalse(self.active_path.exists())
+        self.assertEqual(index_path.read_bytes(), index_before)
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        database_after = connection.execute(
+            "SELECT id, rollout_path, title, first_user_message, archived, model_provider "
+            "FROM threads WHERE id=?",
+            (self.active_id,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(database_after[:-1], database_before)
+        self.assertEqual(database_after[-1], profile["provider_id"])
+        self.assertEqual(
+            json.loads(self.archived_path.read_text(encoding="utf-8").splitlines()[0])["payload"]["model_provider"],
+            profile["provider_id"],
+        )
+        switch_log = next(event for event in self.service.logs() if event["action"] == "profile.switch")
+        self.assertEqual(switch_log["status"], "warning")
+        self.assertIn("1 条会话仅剩元数据", switch_log["message"])
+        self.assertEqual(switch_log["details"]["missing_rollout_file_count"], 1)
+        self.assertNotIn(self.active_id, json.dumps(switch_log, ensure_ascii=False))
+
+    def test_switch_refuses_missing_inventory_when_database_points_to_existing_unmanaged_file(self) -> None:
+        profile = self.service.create_api_profile(
+            "Fixture API", "http://127.0.0.1:8317/v1", "secret-key", "gpt-test"
+        )
+        unmanaged = self.codex.parent / "unmanaged-rollout.jsonl"
+        unmanaged_body = (
+            json.dumps(
+                {"type": "session_meta", "payload": {"id": self.active_id, "model_provider": "openai"}},
+                separators=(",", ":"),
+            )
+            + "\n"
+            + json.dumps({"type": "response_item", "payload": {"marker": "unmanaged"}})
+            + "\n"
+        ).encode("utf-8")
+        unmanaged.write_bytes(unmanaged_body)
+        self.active_path.unlink()
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        connection.execute(
+            "UPDATE threads SET rollout_path=? WHERE id=?",
+            (str(unmanaged), self.active_id),
+        )
+        connection.commit()
+        connection.close()
+        config_before = (self.codex / "config.toml").read_bytes()
+
+        with self.assertRaisesRegex(GuardianError, "无法确认只是已删除的受管聊天文件"):
+            self.service.switch_profile(profile["id"])
+
+        self.assertEqual(unmanaged.read_bytes(), unmanaged_body)
+        self.assertEqual((self.codex / "config.toml").read_bytes(), config_before)
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        row = connection.execute(
+            "SELECT rollout_path, archived, model_provider FROM threads WHERE id=?",
+            (self.active_id,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(row, (str(unmanaged), 0, "openai"))
+
+    def test_switch_refuses_missing_rollout_reference_outside_managed_directories(self) -> None:
+        profile = self.service.create_api_profile(
+            "Fixture API", "http://127.0.0.1:8317/v1", "secret-key", "gpt-test"
+        )
+        outside_missing = self.codex.parent / "already-absent-rollout.jsonl"
+        self.active_path.unlink()
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        connection.execute(
+            "UPDATE threads SET rollout_path=? WHERE id=?",
+            (str(outside_missing), self.active_id),
+        )
+        connection.commit()
+        connection.close()
+        config_before = (self.codex / "config.toml").read_bytes()
+
+        with self.assertRaisesRegex(GuardianError, "无法确认只是已删除的受管聊天文件"):
+            self.service.switch_profile(profile["id"])
+
+        self.assertFalse(outside_missing.exists())
+        self.assertEqual((self.codex / "config.toml").read_bytes(), config_before)
+        connection = sqlite3.connect(self.codex / "state_5.sqlite")
+        row = connection.execute(
+            "SELECT rollout_path, archived, model_provider FROM threads WHERE id=?",
+            (self.active_id,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(row, (str(outside_missing), 0, "openai"))
+
     def test_switch_refuses_divergent_duplicate_rollouts_and_restores_config(self) -> None:
         profile = self.service.create_api_profile(
             "Fixture API", "http://127.0.0.1:8317/v1", "secret-key", "gpt-test"

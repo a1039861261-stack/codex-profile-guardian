@@ -48,7 +48,7 @@ from gateway.protocols.responses import normalize_protocol_compatibility
 
 
 APP_NAME = "Codex Profile Guardian"
-APP_VERSION = "1.10.3"
+APP_VERSION = "1.10.4"
 SCHEMA_VERSION = 1
 MANAGED_START = "# BEGIN CODEX PROFILE GUARDIAN MANAGED"
 MANAGED_END = "# END CODEX PROFILE GUARDIAN MANAGED"
@@ -3975,17 +3975,55 @@ class GuardianService:
         by_id = inventory["by_id"]
         database_ids = {str(row[0]) for row in rows}
         missing = sorted(database_ids - set(by_id))
-        if missing:
+        rows_by_id = {str(row[0]): row for row in rows}
+        missing_active = 0
+        missing_archived = 0
+        unsafe_missing_references = 0
+        managed_roots = tuple(
+            (self.codex_home / directory).resolve()
+            for directory in ("sessions", "archived_sessions")
+        )
+        # Manual cleanup can legitimately leave a SQLite row after its rollout
+        # disappears. Preserve that user state and migrate only its provider;
+        # never synthesize a chat body. A live, mismatched, or out-of-scope path
+        # remains ambiguous and must continue to fail closed.
+        for thread_id in missing:
+            _, archived_raw, rollout_path_raw = rows_by_id[thread_id]
+            if bool(int(archived_raw or 0)):
+                missing_archived += 1
+            else:
+                missing_active += 1
+            raw_path = str(rollout_path_raw or "").strip()
+            if not raw_path:
+                continue
+            candidate = Path(raw_path)
+            if not candidate.is_absolute():
+                candidate = self.codex_home / candidate
+            try:
+                resolved_candidate = candidate.resolve()
+                candidate_is_managed = any(
+                    resolved_candidate.is_relative_to(root) for root in managed_roots
+                )
+                candidate_exists = candidate.exists() or candidate.is_symlink()
+            except OSError:
+                candidate_is_managed = False
+                candidate_exists = True
+            if not candidate_is_managed or candidate_exists:
+                unsafe_missing_references += 1
+        if unsafe_missing_references:
             raise GuardianError(
-                f"SQLite 中有 {len(missing)} 条会话找不到对应聊天文件，已中止迁移。"
+                "SQLite 中有 "
+                f"{unsafe_missing_references} 条会话无法确认只是已删除的受管聊天文件"
+                "（路径越界、文件仍存在或 ID 不匹配），"
+                "已中止迁移。"
             )
         archive_mismatches = 0
         stale_paths = 0
         for thread_id_raw, archived_raw, rollout_path_raw in rows:
             thread_id = str(thread_id_raw)
-            entries = by_id[thread_id]
+            entries = by_id.get(thread_id, [])
             archived = bool(int(archived_raw or 0))
-            if not any(bool(entry["archived"]) == archived for entry in entries):
+            if entries and not any(bool(entry["archived"]) == archived for entry in entries):
                 archive_mismatches += 1
             if rollout_path_raw is None:
                 stale_paths += 1
@@ -4010,6 +4048,9 @@ class GuardianService:
             "prefix_duplicate_rollout_id_count": int(inventory["prefix_duplicate_ids"]),
             "orphan_rollout_count": len(set(by_id) - database_ids),
             "stale_rollout_path_count": stale_paths,
+            "missing_rollout_file_count": len(missing),
+            "missing_active_rollout_file_count": missing_active,
+            "missing_archived_rollout_file_count": missing_archived,
         }
 
     def _rewrite_rollouts(
@@ -4270,13 +4311,20 @@ class GuardianService:
                     if item["id"] == profile_id:
                         item["last_used_at"] = utc_now()
                 self._save_state(state)
+                missing_rollouts = int(migration["missing_rollout_file_count"])
                 self._log(
                     "profile.switch",
-                    "success",
-                    f"已写入账号线路：{profile['name']}，等待 Codex 启动后复核",
+                    "warning" if missing_rollouts else "success",
+                    (
+                        f"已写入账号线路：{profile['name']}；SQLite 中有 {missing_rollouts} 条会话仅剩元数据，"
+                        "对应聊天文件已不存在；已保留元数据且未伪造聊天正文，等待 Codex 启动后复核"
+                        if missing_rollouts
+                        else f"已写入账号线路：{profile['name']}，等待 Codex 启动后复核"
+                    ),
                     profile_id=profile_id,
                     backup=backup["name"],
                     archived_count=migration["archived_count"],
+                    missing_rollout_file_count=missing_rollouts,
                 )
             except Exception as exc:
                 self._restore_files_from_backup(backup_root)

@@ -1569,11 +1569,14 @@ export function App() {
       result = await run(() => api(`/api/profiles/${action.profile.id}/switch`, { method: "POST", body: "{}" }), null);
       if (result) {
         const verification = result.migration?.post_restart_verification;
+        const missingRollouts = result.migration?.missing_rollout_file_count || 0;
         notify(
-          verification?.verified
-            ? `已切换到 ${action.profile.name}，Codex 重启后本地聊天复核通过`
-            : `已切换到 ${action.profile.name}，请在 Codex 中复核任务列表`,
-          verification?.verified ? "success" : "warning",
+          missingRollouts
+            ? `已切换到 ${action.profile.name}；${missingRollouts} 条会话仅剩 SQLite 元数据，未重建已缺失的聊天文件。${verification?.verified ? "Codex 重启后复核通过" : "请在 Codex 中复核任务列表"}`
+            : verification?.verified
+              ? `已切换到 ${action.profile.name}，Codex 重启后本地聊天复核通过`
+              : `已切换到 ${action.profile.name}，请在 Codex 中复核任务列表`,
+          verification?.verified && !missingRollouts ? "success" : "warning",
         );
       }
     } else if (action.type === "sync") {

@@ -27,7 +27,11 @@ class GuardianManagementHttpTests(unittest.TestCase):
         self.codex_home.mkdir()
         self.web_root.mkdir()
         (self.web_root / "index.html").write_text("<!doctype html><title>fixture</title>", encoding="utf-8")
-        self.service = GuardianService(codex_home=self.codex_home, data_dir=self.data_dir)
+        # HTTP contract tests do not need to repeat Windows ACL subprocesses for
+        # every fixture. Dedicated Claude integration tests still verify the real
+        # private ACLs end to end.
+        with patch("backend.claude_desktop._restrict_private_path"):
+            self.service = GuardianService(codex_home=self.codex_home, data_dir=self.data_dir)
         self._add_profiles()
         self.server = start_server(
             self.service,

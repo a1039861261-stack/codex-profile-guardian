@@ -344,10 +344,7 @@ class GatewayG6ControlTransactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(activated["state"], "active")
 
     async def test_expired_and_failed_activation_keep_old_file_and_revision(self) -> None:
-        host, config_path, document = await self._start_host(
-            "rollback",
-            prepared_config_ttl_seconds=0.05,
-        )
+        host, config_path, document = await self._start_host("rollback")
         candidate = self._candidate(document)
         before = config_path.read_bytes()
         control_port = document["listen"]["control_port"]
@@ -368,7 +365,12 @@ class GatewayG6ControlTransactionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(host.config.active_group.revision, 1)
             self.assertEqual(host._provider.current_config().revision, 1)
 
-            await asyncio.sleep(0.08)
+            self.assertIsNotNone(host._prepared_config)
+            host._prepared_config = replace(
+                host._prepared_config,
+                expires_at_monotonic=0.0,
+                expires_at_epoch=0.0,
+            )
             status, expired = await self._post(
                 client,
                 f"{base}/activate",

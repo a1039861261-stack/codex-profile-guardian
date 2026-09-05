@@ -1,13 +1,17 @@
 # Prototype Instructions
 
-## Cloud-first development and release
+## Mandatory cloud-only development (owner instruction, 2026-09-06)
 
-- Prefer GitHub web editing or an explicitly selected remote development environment. Run dependency installation, full tests and Windows packaging on the GitHub-hosted runner in `.github/workflows/windows-release.yml`, not on the owner's computer. Do not start a local preview server unless the current task needs local visual acceptance and the user agrees to the local resource use.
-- Never configure a self-hosted runner on the owner's computer or create a paid Codespace without explicit approval. GitHub stores source; Actions performs tests and builds, not autonomous code authoring.
-- Publish only reviewed public source and versioned release assets. Never upload private Git history, account data, credentials, chats, SQLite, diagnostics or private rollback backups.
-- A manual workflow dispatch with `publish=true` is the release request for that run. Ordinary pushes and pull requests only build; they must not update Releases or install software.
-- Hosted runner workspaces are disposable. Local deletion is a separate operation: verify remote commits/assets, dirty and untracked files, worktree registrations and exact path boundaries first. Never automatically delete the owner's whole checkout, private data or immutable v1.6.2 rollback baseline after a push.
-- See `docs/CLOUD-DEVELOPMENT.md` for the cloud workflow and cleanup boundaries.
+- The owner's computer is not a development, test, build or preview host for this project. Create and edit public source through GitHub's web editor/API, or in an explicitly selected remote development environment. Do not create, update or clone local source checkouts/worktrees for ordinary development.
+- Do not install or recreate local Python/Node dependencies, virtual environments, node_modules, compiler caches, build outputs, test fixtures or preview servers. Needing tests or visual acceptance is not an exception: run them remotely. Only a later explicit owner instruction changing this policy can authorize local development.
+- Existing local source folders are retained legacy records, not active development environments. Lightweight read-only inspection, GitHub API operations, explicitly authorized cleanup and explicitly requested installation remain separate permitted operations; none authorizes rebuilding the local development environment.
+- Run dependency installation, full tests, Windows packaging and isolated installer acceptance only on the GitHub-hosted windows-2022 runner in .github/workflows/windows-release.yml. Never configure a self-hosted runner on the owner's computer. Do not create paid Codespaces or other paid compute without explicit approval.
+- Use disposable hosted workspaces, no cross-run dependency cache, and the existing three-day Actions artifact retention. Keep versioned Releases online. Do not download build artifacts or reconstruct large local verification copies by default; use cloud verification and download only for an explicitly requested delivery or installation.
+- Never upload private Git history, accounts, credentials, DPAPI data, chats, SQLite, diagnostics or private rollback backups. Do not create new local chat/installation backups for ordinary development. Safety backups for explicitly approved real-data operations remain a separate, scoped workflow.
+- A new release requires that run's explicit authorization and manual workflow dispatch with publish=true on main. Ordinary pushes and pull requests only build; they do not publish Releases or install software. Existing versions and tags are not replaced.
+- Local deletion remains separately authorized and path-scoped: inspect dirty/untracked files and worktree registrations, preserve unique source and the immutable v1.6.2 rollback baseline, and verify recoverability or obtain explicit informed permanent-deletion consent for private historical backups. Never automatically delete the owner's whole checkout or live chat/account data after a push.
+- GitHub stores source and Actions provides remote execution; GitHub does not autonomously author code. Codex, the browser and installed Guardian still consume normal client/runtime RAM on the owner's computer. This policy removes local development workloads, not all local memory use.
+- See docs/CLOUD-DEVELOPMENT.md for the workflow. These mandatory restrictions supersede any legacy local-server or local-build suggestions elsewhere in this repository.
 
 Before making substantial visual changes, use the Product Design plugin's `get-context` skill when the visual source is unclear or no longer matches the current goal. When the user gives durable prototype-specific design feedback, preferences, or decisions, record them in `AGENTS.md`.
 

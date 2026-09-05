@@ -51,7 +51,8 @@ def auth_payload(account: str, refresh: str, *, last_refresh: str = "2026-07-06T
 class GuardianServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
-        root = Path(self.temp.name)
+        # Match the canonical paths used by the production path-safety checks.
+        root = Path(self.temp.name).resolve()
         self.codex = root / ".codex"
         self.data = root / "guardian-data"
         (self.codex / "sessions" / "2026" / "07" / "06").mkdir(parents=True)
@@ -2257,7 +2258,7 @@ for line in sys.stdin:
 
     def test_remote_reconcile_quarantines_prefix_duplicate_without_changing_archive(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            root = Path(temp).resolve()
             codex = root / ".codex"
             active_dir = codex / "sessions" / "2026" / "07" / "09"
             archived_dir = codex / "archived_sessions"

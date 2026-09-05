@@ -22,7 +22,8 @@ SECRET_CANARY = "CLAUDE-DESKTOP-SECRET-CANARY"
 class ClaudeDesktopIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        # Windows hosted runners may expose TEMP through an 8.3 path alias.
+        self.root = Path(self.temporary.name).resolve()
         self.local_appdata = self.root / "local"
         self.cc_switch_home = self.root / "cc-switch"
         self.integration = ClaudeDesktopIntegration(

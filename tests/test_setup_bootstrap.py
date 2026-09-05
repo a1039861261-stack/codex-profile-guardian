@@ -66,7 +66,8 @@ class SetupBootstrapTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "payload"
             root.mkdir()
-            smoke = Path(temporary) / "smoke"
+            # The installer canonicalizes aliases before producing scoped paths.
+            smoke = Path(temporary).resolve() / "smoke"
             command = setup_bootstrap.build_install_command(root, smoke_root=smoke)
             joined = "\n".join(command)
             self.assertIn("-NoSuccessPopup", command)

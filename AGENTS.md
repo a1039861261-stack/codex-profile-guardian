@@ -1,6 +1,13 @@
 # Prototype Instructions
 
-Run the local server yourself and open the preview in the in-app browser. Do not give the user server-start instructions when you can run it.
+## Cloud-first development and release
+
+- Prefer GitHub web editing or an explicitly selected remote development environment. Run dependency installation, full tests and Windows packaging on the GitHub-hosted runner in `.github/workflows/windows-release.yml`, not on the owner's computer. Do not start a local preview server unless the current task needs local visual acceptance and the user agrees to the local resource use.
+- Never configure a self-hosted runner on the owner's computer or create a paid Codespace without explicit approval. GitHub stores source; Actions performs tests and builds, not autonomous code authoring.
+- Publish only reviewed public source and versioned release assets. Never upload private Git history, account data, credentials, chats, SQLite, diagnostics or private rollback backups.
+- A manual workflow dispatch with `publish=true` is the release request for that run. Ordinary pushes and pull requests only build; they must not update Releases or install software.
+- Hosted runner workspaces are disposable. Local deletion is a separate operation: verify remote commits/assets, dirty and untracked files, worktree registrations and exact path boundaries first. Never automatically delete the owner's whole checkout, private data or immutable v1.6.2 rollback baseline after a push.
+- See `docs/CLOUD-DEVELOPMENT.md` for the cloud workflow and cleanup boundaries.
 
 Before making substantial visual changes, use the Product Design plugin's `get-context` skill when the visual source is unclear or no longer matches the current goal. When the user gives durable prototype-specific design feedback, preferences, or decisions, record them in `AGENTS.md`.
 

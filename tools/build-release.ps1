@@ -2,6 +2,7 @@ param(
     [switch]$SkipTests,
     [switch]$SkipInstaller,
     [switch]$AllowDirty,
+    [switch]$IsolatedHostedRunner,
     [string]$StableInstaller = $env:GUARDIAN_STABLE_INSTALLER
 )
 
@@ -42,6 +43,18 @@ function Assert-VersionConsistency {
 }
 
 function Assert-StableBaseline {
+    if ($IsolatedHostedRunner) {
+        if ($env:GITHUB_ACTIONS -ne "true" -or $env:RUNNER_ENVIRONMENT -ne "github-hosted") {
+            throw "IsolatedHostedRunner requires an ephemeral GitHub-hosted runner"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($StableInstaller)) {
+            throw "Hosted isolation must not mount a local stable installer"
+        }
+        if ($Version -eq "1.6.2" -or (Test-Path -LiteralPath (Join-Path $OutputRoot "CodexProfileGuardianSetup-v1.6.2.exe"))) {
+            throw "Hosted release must not contain or overwrite the v1.6.2 baseline"
+        }
+        return "absent_on_ephemeral_github_runner"
+    }
     if ([string]::IsNullOrWhiteSpace($StableInstaller)) {
         throw "Stable v1.6.2 installer path is required via -StableInstaller or GUARDIAN_STABLE_INSTALLER"
     }
@@ -51,11 +64,12 @@ function Assert-StableBaseline {
     if ((Get-FileHash -LiteralPath $Stable -Algorithm SHA256).Hash -ne $Expected) {
         throw "Stable v1.6.2 installer hash changed"
     }
+    return "verified_local_file"
 }
 
 Set-Location $ProjectRoot
 Assert-VersionConsistency
-Assert-StableBaseline
+$BaselineVerification = Assert-StableBaseline
 if (-not $AllowDirty) {
     $Dirty = @(git status --porcelain)
     if ($LASTEXITCODE -ne 0 -or $Dirty.Count -ne 0) { throw "Release build requires a clean worktree" }
@@ -159,9 +173,12 @@ $Manifest = [ordered]@{
     gateway_version = $GatewayVersion
     generated_at = [DateTimeOffset]::UtcNow.ToString("o")
     signed = $false
+    source_commit = (git rev-parse HEAD).Trim()
+    source_tree = (git rev-parse 'HEAD^{tree}').Trim()
     stable_baseline = [ordered]@{
         version = "1.6.2"
         sha256 = "8B5EDA7461BD02E677CA5881804A1D90D25D994FCB46439AE9A9D642AAFABC40"
+        verification = $BaselineVerification
     }
     artifacts = @($Entries)
 }

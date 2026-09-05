@@ -24,6 +24,12 @@ from urllib import request as urlrequest
 import uuid
 
 from .claude_desktop import ClaudeDesktopError, ClaudeDesktopIntegration
+from .codex_lifecycle import (
+    close_codex_gracefully,
+    desktop_process_filter,
+    query_codex_processes,
+    related_processes,
+)
 from .failover_diagnostics import (
     DiagnosticBundle,
     DiagnosticBundleError,
@@ -48,7 +54,7 @@ from gateway.protocols.responses import normalize_protocol_compatibility
 
 
 APP_NAME = "Codex Profile Guardian"
-APP_VERSION = "1.10.4"
+APP_VERSION = "1.10.5"
 SCHEMA_VERSION = 1
 MANAGED_START = "# BEGIN CODEX PROFILE GUARDIAN MANAGED"
 MANAGED_END = "# END CODEX PROFILE GUARDIAN MANAGED"
@@ -2285,22 +2291,7 @@ class GuardianService:
     def _windows_codex_process_filter() -> str:
         # New Store builds use ChatGPT.exe while keeping the OpenAI.Codex package.
         # This filter intentionally identifies the visible desktop process only.
-        return (
-            "(($_.Name -ieq 'ChatGPT.exe') -or ($_.Name -ieq 'Codex.exe')) -and ("
-            "$_.ExecutablePath -match '\\\\WindowsApps\\\\OpenAI\\.Codex_[^\\\\]+\\\\app\\\\(ChatGPT|Codex)\\.exe$' -or "
-            "$_.CommandLine -match '--remote-debugging-port=')"
-        )
-
-    @classmethod
-    def _windows_codex_related_process_filter(cls) -> str:
-        # Closing must also account for an orphaned packaged app-server. A plain
-        # codex CLI process outside the Store package is deliberately excluded.
-        app_server = (
-            "(($_.Name -ieq 'codex.exe') -and "
-            "$_.ExecutablePath -match '\\\\WindowsApps\\\\OpenAI\\.Codex_[^\\\\]+\\\\app\\\\resources\\\\codex\\.exe$' -and "
-            "$_.CommandLine -match '(^|\\s)app-server(\\s|$)')"
-        )
-        return f"(({cls._windows_codex_process_filter()}) -or ({app_server}))"
+        return desktop_process_filter()
 
     @classmethod
     def _windows_codex_writer_process_filter(cls) -> str:
@@ -2361,18 +2352,18 @@ class GuardianService:
         return self._windows_processes_running(self._windows_codex_process_filter())
 
     def _codex_related_running(self) -> bool:
-        if os.name != "nt":
-            return False
-        return self._windows_processes_running(
-            self._windows_codex_related_process_filter()
-        )
+        return self._codex_related_process_state() is True
 
     def _codex_related_process_state(self) -> bool | None:
         if os.name != "nt":
             return False
-        return self._windows_process_match_state(
-            self._windows_codex_related_process_filter()
-        )
+        snapshot = query_codex_processes()
+        if snapshot is None:
+            return None
+        known = {p.identity for p in getattr(self, "_observed_codex_processes", ())}
+        known.update(p.identity for p in related_processes(snapshot))
+        self._observed_codex_processes = tuple(p for p in snapshot if p.identity in known)
+        return bool(self._observed_codex_processes)
 
     def _codex_turn_writer_state(self) -> str:
         if self.is_fixture or os.name != "nt":
@@ -2386,39 +2377,37 @@ class GuardianService:
             return "stopped"
         return "unknown"
 
-    def request_close_codex(self, timeout_seconds: int = 15) -> bool:
+    def request_close_codex(self, timeout_seconds: int = 30) -> bool:
         if self.is_fixture:
             return True
         initial_state = self._codex_related_process_state()
         if initial_state is False:
             return True
         if initial_state is None:
+            self._last_codex_close_report = {"ok": False, "reason": "process_query_failed"}
+            self._log("codex.close", "warning", "无法确认 Codex 进程状态，未发送关闭请求。", **self._last_codex_close_report)
             return False
-        discover = (
-            "$all=@(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
-            "Where-Object { " + self._windows_codex_related_process_filter() + " }); "
-            "$ids=@($all.ProcessId); "
-            "$roots=@($all | Where-Object { $ids -notcontains $_.ParentProcessId }); "
+        report = close_codex_gracefully(timeout_seconds, observed=getattr(self, "_observed_codex_processes", ()))
+        self._last_codex_close_report = report
+        self._log(
+            "codex.close", "success" if report["ok"] else "warning",
+            "Codex 已正常退出。" if report["ok"] else self._codex_close_failure_message(report),
+            **report,
         )
-        graceful_script = discover + (
-            "foreach($p in $roots){ & taskkill.exe /PID $p.ProcessId /T 2>$null | Out-Null }"
-        )
-        subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command", graceful_script],
-            capture_output=True,
-            timeout=8,
-            creationflags=0x08000000,
-        )
-        graceful_deadline = time.time() + min(5, max(2, timeout_seconds // 2))
-        while time.time() < graceful_deadline:
-            state = self._codex_related_process_state()
-            if state is False:
-                return True
-            if state is None:
-                return False
-            time.sleep(0.4)
+        return bool(report["ok"])
 
-        return False
+    @staticmethod
+    def _codex_close_failure_message(report: dict[str, Any]) -> str:
+        reason = report.get("reason")
+        messages = {
+            "process_query_failed": "无法确认 Codex 后台是否已经退出，请稍后重试。",
+            "desktop_restarted": "等待退出时检测到新启动的 Codex，已停止切换，请确认任务状态后重试。",
+            "no_close_window": "Codex 后台仍在运行，但没有可正常关闭的窗口；请从 Codex 菜单退出后重试。",
+            "window_disabled": "Codex 有待处理的弹窗，请先处理弹窗后重试。",
+            "window_close_failed": "Windows 未能发送正常关闭请求，请检查 Codex 弹窗及两个程序的运行权限后重试。",
+        }
+        prefix = messages.get(reason, f"已请求正常退出，但 Codex 在 {report.get('wait_seconds', 30):g} 秒内仍未完全退出，请检查 Codex 后重试。")
+        return prefix + " Guardian 未强制结束进程，也未开始修改账号或聊天文件。"
 
     @staticmethod
     def _recent_rollout_turn_state(path: Path, *, now: float) -> tuple[str | None, int | None]:
@@ -2619,17 +2608,26 @@ class GuardianService:
         if related_state is False:
             return
         if related_state is None:
+            self._log("codex.close", "warning", "无法查询 Codex 后台进程状态，未开始切换。", reason="process_query_failed")
             raise GuardianPublicError(
                 "codex_process_state_uncertain",
                 "无法查询 Codex 后台进程状态，Guardian 未关闭进程，也未修改任何文件。请重试后再切换。",
                 retryable=True,
             )
-        if settings.get("auto_close_codex", True) and self.request_close_codex():
+        if not settings.get("auto_close_codex", True):
+            raise GuardianPublicError(
+                "codex_close_incomplete",
+                "已关闭“切换前自动关闭 Codex”设置，请开启该设置，或自行退出 Codex 后重试。",
+                retryable=True,
+            )
+        self._last_codex_close_report = {}
+        if self.request_close_codex():
             self._ensure_no_active_turns()
             return
         raise GuardianPublicError(
             "codex_close_incomplete",
-            "Codex 未能安全退出。Guardian 不会强制结束进程；请确认任务已完成并手动退出 Codex，然后重试。",
+            self._codex_close_failure_message(self._last_codex_close_report),
+            details={"close": self._last_codex_close_report},
             retryable=True,
         )
 

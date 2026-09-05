@@ -978,7 +978,7 @@ function Settings({ status, onSave, onOpen, onRemoteSync, onUpdateCheck, onUpdat
     <div className="page-stack settings-layout">
       <section className="content-panel settings-panel">
         <header className="settings-heading"><span className="section-accent" /><div><h2>切换策略</h2><p>控制 Codex 关闭与重启行为</p></div></header>
-        <Toggle checked={settings.auto_close_codex ?? true} onChange={(value) => setSetting("auto_close_codex", value)} label="切换前自动关闭 Codex" detail="先正常退出；超时后只清理 Codex 自身的残留进程" />
+        <Toggle checked={settings.auto_close_codex ?? true} onChange={(value) => setSetting("auto_close_codex", value)} label="切换前自动关闭 Codex" detail="自动请求正常退出并等待最多 30 秒；不会强制结束进程" />
         <Toggle checked={settings.auto_launch_codex ?? true} onChange={(value) => setSetting("auto_launch_codex", value)} label="切换成功后自动启动 Codex" detail="优先使用 Microsoft Store 系统入口" />
       </section>
       <section className="content-panel settings-panel update-panel">
@@ -1214,7 +1214,7 @@ function ConfirmModal({ action, status, onClose, onConfirm, busy }) {
   return (
     <Modal
       title={isUpdateInstall ? "安装已经校验的新版本？" : isRestore ? "恢复这个备份？" : isDelete ? "删除这个账号？" : isSync ? `更新 ${profile?.name} 的登录？` : isRemoteSync ? `同步 ${profile?.name} 到 SSH？` : `切换到 ${profile?.name}？`}
-      description={isUpdateInstall ? "将启动版本化安装包；安装器会排空后台网关，并在升级失败时恢复旧版本" : isRestore ? "恢复会回到该时间点的配置与会话索引" : isDelete ? "只删除 Guardian 保存的加密凭据" : isSync ? "将自动关闭 Codex，并读取刚刚重新登录后的最新凭据" : isRemoteSync ? `将写入 ${action?.hostCount || 0} 台已登记 SSH 主机，并让远端 Codex 重新加载配置` : "已完成只读预检；只尝试正常关闭 Codex，绝不会强制结束进程"}
+      description={isUpdateInstall ? "将启动版本化安装包；安装器会排空后台网关，并在升级失败时恢复旧版本" : isRestore ? "恢复会回到该时间点的配置与会话索引" : isDelete ? "只删除 Guardian 保存的加密凭据" : isSync ? "将自动关闭 Codex，并读取刚刚重新登录后的最新凭据" : isRemoteSync ? `将写入 ${action?.hostCount || 0} 台已登记 SSH 主机，并让远端 Codex 重新加载配置` : "已完成只读预检；将自动正常关闭 Codex，最多等待 30 秒，不会强制结束进程"}
       onClose={onClose}
       size="small"
     >

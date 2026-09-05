@@ -2459,19 +2459,42 @@ for line in sys.stdin:
     def test_auto_close_never_falls_back_to_force_for_remaining_process_tree(self) -> None:
         self.service.is_fixture = False
         self.service._codex_related_process_state = Mock(return_value=True)  # type: ignore[method-assign]
-        with patch("backend.guardian.subprocess.run") as run, patch(
-            "backend.guardian.time.time", side_effect=[0, 10]
-        ):
+        report = {"ok": False, "reason": "exit_timeout", "wait_seconds": 30, "remaining_count": 1}
+        with patch("backend.guardian.close_codex_gracefully", return_value=report) as close, patch("backend.guardian.subprocess.run") as run:
             self.assertFalse(self.service.request_close_codex())
-        self.assertEqual(run.call_count, 1)
-        graceful = run.call_args.args[0][-1]
-        self.assertIn("taskkill.exe /PID", graceful)
-        self.assertIn("/T", graceful)
-        self.assertIn("ChatGPT.exe", graceful)
-        self.assertIn("OpenAI\\.Codex_", graceful)
-        self.assertIn("resources\\\\codex", graceful)
-        self.assertIn("app-server", graceful)
-        self.assertNotIn("/F /PID", graceful)
+        close.assert_called_once_with(30, observed=())
+        run.assert_not_called()
+        logged = json.loads(self.service.logs_path.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(logged["action"], "codex.close")
+        self.assertEqual(logged["details"], report)
+
+    def test_close_failure_stops_switch_before_backup_or_account_writes(self) -> None:
+        profile = self.service.create_api_profile("close fixture", "https://api.example.invalid/v1", "fixture-key", "gpt-5")
+        before = {path: path.read_bytes() for path in self.codex.rglob("*") if path.is_file()}
+        self.service.is_fixture = False
+        self.service._codex_related_process_state = Mock(return_value=True)
+        self.service._ensure_no_active_turns = Mock()
+        report = {"ok": False, "reason": "window_close_failed", "win32_error": 5}
+        with patch("backend.guardian.close_codex_gracefully", return_value=report), patch.object(self.service, "create_backup") as backup:
+            with self.assertRaises(GuardianPublicError) as raised:
+                self.service.switch_profile(profile["id"])
+        backup.assert_not_called()
+        self.assertEqual(raised.exception.code, "codex_close_incomplete")
+        self.assertEqual(raised.exception.details["close"], report)
+        self.assertIn("运行权限", raised.exception.public_message)
+        self.assertEqual(before, {path: path.read_bytes() for path in self.codex.rglob("*") if path.is_file()})
+
+    def test_auto_close_disabled_is_an_explicit_setting_not_a_false_timeout(self) -> None:
+        self.service.update_settings({"auto_close_codex": False})
+        self.service.is_fixture = False
+        self.service._codex_related_process_state = Mock(return_value=True)
+        self.service._ensure_no_active_turns = Mock()
+        with patch.object(self.service, "request_close_codex") as close:
+            with self.assertRaises(GuardianPublicError) as raised:
+                self.service._ensure_codex_closed()
+        close.assert_not_called()
+        self.assertIn("已关闭", raised.exception.public_message)
+        self.assertIn("设置", raised.exception.public_message)
 
     def test_ensure_closed_handles_orphaned_packaged_app_server(self) -> None:
         self.service.is_fixture = False
@@ -2502,7 +2525,7 @@ for line in sys.stdin:
 
     def test_writer_filter_covers_cli_without_expanding_close_scope(self) -> None:
         writer_filter = GuardianService._windows_codex_writer_process_filter()
-        close_filter = GuardianService._windows_codex_related_process_filter()
+        close_filter = GuardianService._windows_codex_process_filter()
 
         self.assertIn("$_.Name -ieq 'codex.exe'", writer_filter)
         self.assertIn("node.exe", writer_filter)

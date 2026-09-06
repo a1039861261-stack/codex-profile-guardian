@@ -307,7 +307,7 @@ code { font-family: "Cascadia Code", Consolas, monospace; }
 .log-state.error { color: #8a6416; background: var(--amber-soft); }
 .log-state svg { width: 17px; }
 .log-copy { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
-.log-copy strong { font-size: 11px; }
+.log-copy strong { font-size: 11px; overflow-wrap: anywhere; }
 .log-copy span { color: var(--faint); font: 500 11px "Cascadia Code", Consolas, monospace; }
 .log-row time { color: var(--muted); font-size: 11px; }
 

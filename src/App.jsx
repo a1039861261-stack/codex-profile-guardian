@@ -1634,7 +1634,15 @@ export function App() {
       }),
       null,
     );
-    if (!result) return;
+    if (!result) {
+      // Show the server's new diagnostic immediately without replacing its toast.
+      try {
+        setLogs(await api("/api/logs"));
+      } catch {
+        // Keep the original failure visible if the log service is unavailable.
+      }
+      return;
+    }
     setConflictConfirmOpen(false);
     await refreshConflicts({ silent: true });
     notify(

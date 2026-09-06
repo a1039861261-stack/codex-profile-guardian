@@ -49,13 +49,23 @@ def verify(browser, width: int, height: int) -> dict:
         page = context.new_page()
         page.set_default_timeout(30000)
         errors = []
+        console_issues = []
         page.on("pageerror", lambda error: errors.append(type(error).__name__))
+
+        def console_message(message):
+            if message.type in ("warning", "error"):
+                # Chromium reports the intentional HTTP 409 as a resource error.
+                if message.type == "error" and "Failed to load resource" in message.text and "409" in message.text:
+                    return
+                console_issues.append(message.type)
+
+        page.on("console", console_message)
         with patch.object(
             fixture.service, "update_status",
             return_value={"state": "up_to_date", "current_version": "1.10.5", "latest_version": "1.10.5"},
         ):
             page.goto(origin, wait_until="networkidle")
-            page.get_by_role("button", name="聊天保护", exact=True).click()
+            page.locator(".sidebar nav button").filter(has_text="聊天保护").click()
             page.get_by_role("button", name="选择保留副本", exact=True).click()
             # Choose explicitly, matching the stale-database-path customer flow.
             page.locator('input[type="radio"]').first.check()
@@ -96,18 +106,32 @@ def verify(browser, width: int, height: int) -> dict:
             # Dismiss only the notification and modal, never retry repair.
             page.locator(".toast button").click()
             page.get_by_role("button", name="取消", exact=True).click()
-            page.get_by_role("button", name="操作日志", exact=True).click()
+            # The existing compact navigation hides Logs below 680px.
+            # Navigate at desktop width, then verify the log at the target width.
+            if width < 680:
+                page.set_viewport_size({"width": 1440, "height": 960})
+            page.get_by_role("button", name="日志", exact=True).click()
+            if width < 680:
+                page.set_viewport_size({"width": width, "height": height})
             expect(page.get_by_text("history_conflict_database_triggers_present", exact=False)).to_be_visible()
             expect(page.get_by_text(failure["details"]["diagnostic_id"], exact=False)).to_be_visible()
+            log_geometry = page.locator(".log-copy").first.evaluate("""element => ({
+                width: element.clientWidth, scrollWidth: element.scrollWidth,
+                pageWidth: document.documentElement.scrollWidth
+            })""")
+            assert log_geometry["scrollWidth"] <= log_geometry["width"] + 1, log_geometry
+            assert log_geometry["pageWidth"] <= width + 1, log_geometry
             page.screenshot(path=str(screenshots / f"conflict-diagnostic-log-{width}.png"))
         assert not errors, errors
+        assert not console_issues, console_issues
         assert not external, "Unexpected external browser requests"
         assert fixture.protected_hashes() == before, "Synthetic protected history changed"
         return {
             "viewport": f"{width}x{height}", "http_status": response.status,
             "code": failure["code"], "cold_backup_complete": True,
             "history_unchanged": True, "error_visible_in_toast_and_log": True,
-            "javascript_errors": len(errors), "horizontal_overflow": False,
+            "javascript_errors": len(errors), "unexpected_console_issues": len(console_issues),
+            "horizontal_overflow": False, "log_navigation_uses_desktop": width < 680,
         }
     finally:
         if context:

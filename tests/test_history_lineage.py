@@ -238,3 +238,15 @@ class PaginatedHistoryTests(unittest.TestCase):
         with self.assertRaises(GuardianPublicError):
             self.service.resolve_history_conflicts(confirmed=True)
         self.assertEqual(self.hashes(), before)
+
+    def test_malformed_base_is_blocked_without_exposing_or_mutating_data(self):
+        lines = self.current.read_bytes().splitlines(keepends=True)
+        item = json.loads(lines[0])
+        item["payload"]["history_base"] = {"thread_id": "PRIVATE-invalid-source", "end_byte_offset": True}
+        self.current.write_bytes(json.dumps(item).encode() + b"\n" + b"".join(lines[1:]))
+        before = self.hashes()
+        report = self.service.history_conflict_report()
+        self.assertIn("invalid_history_base", report["lineage"]["issue_counts"])
+        self.assertNotIn("PRIVATE-invalid-source", json.dumps(report["lineage"]))
+        self.assertFalse(report["can_isolate"])
+        self.assertEqual(self.hashes(), before)

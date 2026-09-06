@@ -8,6 +8,7 @@ No chat text, paths or IDs are included in the public summary.
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 import re
 import uuid
@@ -24,6 +25,10 @@ def rollout_identity(path: Path):
     match = _NAME.fullmatch(path.name)
     if not match:
         return None
+    try:
+        datetime.strptime(path.name[8:27], "%Y-%m-%dT%H-%M-%S")
+    except ValueError:
+        return None
     return (str(uuid.UUID(match[1])), str(uuid.UUID(match[2] or match[1])))
 
 
@@ -33,6 +38,7 @@ def inspect_lineage(entries, compressed_files=(), references=None):
     by_rollout = defaultdict(list)
     by_path = {item["path"]: item for item in entries}
     edges = {}
+    valid_bases = {}
     paginated = []
     for entry in entries:
         identity = rollout_identity(entry["path"])
@@ -67,15 +73,15 @@ def inspect_lineage(entries, compressed_files=(), references=None):
             continue
         if identity:
             edges[identity[1]] = str(uuid.UUID(base["thread_id"]))
+            valid_bases[entry["path"]] = (edges[identity[1]], base["end_byte_offset"])
 
     for entry in paginated:
         identity = rollout_identity(entry["path"])
         if identity and len(by_rollout[identity[1]]) != 1:
             issues["ambiguous_rollout"].add(identity[1])
-        base = entry.get("history_base")
-        if not identity or identity[1] not in edges:
+        if entry["path"] not in valid_bases:
             continue
-        source_id = edges[identity[1]]
+        source_id, end_byte_offset = valid_bases[entry["path"]]
         sources = by_rollout.get(source_id, [])
         # Even malformed/legacy sources must never be offered for quarantine.
         protected.update(item["thread_id"] for item in sources)
@@ -88,7 +94,7 @@ def inspect_lineage(entries, compressed_files=(), references=None):
         source = sources[0]
         if source.get("history_mode") != "paginated":
             issues["source_not_paginated"].add(source_id)
-        if base["end_byte_offset"] > source["path"].stat().st_size:
+        if end_byte_offset > source["path"].stat().st_size:
             issues["source_offset_out_of_bounds"].add(source_id)
 
     finished = set()

@@ -128,11 +128,12 @@ class UIReleaseContractTests(unittest.TestCase):
         self.assertIn("条会话仅剩 SQLite 元数据，未重建已缺失的聊天文件", application)
         self.assertIn('verification?.verified && !missingRollouts ? "success" : "warning"', application)
 
-    def test_auto_close_discloses_guarded_forced_exit_after_graceful_wait(self) -> None:
+    def test_auto_close_discloses_direct_forced_exit_without_grace_period(self) -> None:
         application = (self.project / "src" / "App.jsx").read_text(encoding="utf-8")
-        self.assertIn("先正常退出，最多等待 30 秒；超时后复核任务并自动结束 Codex 后台进程", application)
-        self.assertIn("复核无进行中任务后自动强制退出", application)
-        self.assertNotIn("不会强制结束进程", application)
+        self.assertIn("直接强制退出 Codex，无需等待正常关闭；有进行中任务时停止切换", application)
+        self.assertIn("将直接强制结束 Codex 后台进程", application)
+        self.assertNotIn("最多等待 30 秒", application)
+        self.assertNotIn("先正常关闭 Codex", application)
 
     def test_history_conflicts_support_explicit_recoverable_copy_selection(self) -> None:
         application = (self.project / "src" / "App.jsx").read_text(encoding="utf-8")

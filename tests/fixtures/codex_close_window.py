@@ -44,6 +44,7 @@ def main():
     def receive(hwnd, message, wparam, lparam):
         nonlocal remaining
         if message == 0x0010:
+            print(json.dumps({"close_requested": True}), flush=True)
             if mode == "ignore":
                 return 0
             if delay and hwnd not in pending:

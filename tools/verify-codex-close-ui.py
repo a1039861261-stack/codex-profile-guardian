@@ -57,14 +57,15 @@ def verify(browser, width, height):
         }):
             page.goto(origin, wait_until="networkidle")
             page.get_by_role("button", name="设置", exact=True).click()
-            expect(page.get_by_text("先正常退出，最多等待 30 秒；超时后复核任务并自动结束 Codex 后台进程", exact=True)).to_be_visible()
+            expect(page.get_by_text("直接强制退出 Codex，无需等待正常关闭；有进行中任务时停止切换", exact=True)).to_be_visible()
             page.get_by_role("button", name="账号", exact=True).click()
             page.set_viewport_size({"width": width, "height": height})
             page.locator(".profile-card").filter(has_text=profile["name"]).get_by_role("button", name="安全切换", exact=True).click()
             dialog = page.get_by_role("dialog", name="切换到 关闭验证账号？", exact=True)
             expect(dialog).to_be_visible()
-            expect(dialog).to_contain_text("复核无进行中任务后自动强制退出")
-            expect(dialog).not_to_contain_text("不会强制结束进程")
+            expect(dialog).to_contain_text("将直接强制结束 Codex 后台进程")
+            expect(dialog).not_to_contain_text("先正常关闭")
+            expect(dialog).not_to_contain_text("30 秒")
             expect(dialog.get_by_role("button", name="安全切换", exact=True)).to_be_enabled()
             geometry = dialog.evaluate("""element => {
                 const r = element.getBoundingClientRect();
@@ -96,7 +97,7 @@ def verify(browser, width, height):
                  for p in fixture.codex.rglob("*") if p.is_file()}
         assert before == after
         assert not errors and not console_issues and not external
-        return {"viewport": f"{width}x{height}", "force_disclosed": True,
+        return {"viewport": f"{width}x{height}", "direct_force_disclosed": True, "grace_period": False,
                 "failed_close_http": 409, "account_and_history_unchanged": True,
                 "retry_and_cancel_available": True, "javascript_errors": 0,
                 "unexpected_console_issues": 0, "horizontal_overflow": False,

@@ -2457,14 +2457,14 @@ for line in sys.stdin:
         self.service._update_config = original_method  # type: ignore[method-assign]
         self.assertEqual((self.codex / "config.toml").read_bytes(), original_config)
 
-    def test_auto_close_passes_mandatory_guard_and_owned_identities_to_fallback(self) -> None:
+    def test_auto_close_calls_direct_force_with_task_guard_and_owned_identities(self) -> None:
         self.service.is_fixture = False
         self.service._codex_related_process_state = Mock(return_value=True)  # type: ignore[method-assign]
-        report = {"ok": False, "reason": "exit_timeout", "wait_seconds": 30, "remaining_count": 1}
-        with patch("backend.guardian.close_codex_gracefully", return_value=report) as close, patch("backend.guardian.subprocess.run") as run:
+        report = {"ok": False, "reason": "force_exit_timeout", "wait_seconds": 5, "remaining_count": 1, "force_attempted": True}
+        with patch("backend.guardian.force_close_codex", return_value=report) as close, patch("backend.guardian.subprocess.run") as run:
             self.assertFalse(self.service.request_close_codex())
         close.assert_called_once_with(
-            30, observed=(), force_after_timeout=True,
+            5, observed=(),
             before_force=self.service._ensure_no_active_turns, force_owned=(),
         )
         run.assert_not_called()
@@ -2478,8 +2478,8 @@ for line in sys.stdin:
         self.service.is_fixture = False
         self.service._codex_related_process_state = Mock(return_value=True)
         self.service._ensure_no_active_turns = Mock()
-        report = {"ok": False, "reason": "window_close_failed", "win32_error": 5}
-        with patch("backend.guardian.close_codex_gracefully", return_value=report), patch.object(self.service, "create_backup") as backup:
+        report = {"ok": False, "reason": "force_termination_failed", "win32_error": 5, "force_attempted": True}
+        with patch("backend.guardian.force_close_codex", return_value=report), patch.object(self.service, "create_backup") as backup:
             with self.assertRaises(GuardianPublicError) as raised:
                 self.service.switch_profile(profile["id"])
         backup.assert_not_called()
@@ -2602,7 +2602,7 @@ for line in sys.stdin:
         ])
         def recheck(*args, **kwargs):
             kwargs["before_force"]()
-        with patch("backend.guardian.close_codex_gracefully", side_effect=recheck), patch.object(self.service, "create_backup") as backup:
+        with patch("backend.guardian.force_close_codex", side_effect=recheck), patch.object(self.service, "create_backup") as backup:
             with self.assertRaises(GuardianPublicError) as raised:
                 self.service.switch_profile(profile["id"])
         self.assertEqual(raised.exception.code, "codex_active_turn")

@@ -286,6 +286,89 @@ class WindowsProcessTerminator:
                 self.kernel32.CloseHandle(handle)
 
 
+def force_close_codex(
+    timeout_seconds: float = 5,
+    *,
+    query: Callable[[], list[CodexProcess] | None] = query_codex_processes,
+    observed: tuple[CodexProcess, ...] = (),
+    force_owned: tuple[CodexProcess, ...] = (),
+    before_force: Callable[[], None] | None = None,
+    terminator: WindowsProcessTerminator | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict:
+    """Terminate the verified desktop family immediately; only wait AFTERWARD.
+
+    No window enumeration, WM_CLOSE or graceful-exit grace period occurs.
+    The caller's task guard runs after the native batch handles are pinned.
+    """
+    started = clock()
+    timeout_seconds = max(1.0, min(15.0, float(timeout_seconds)))
+    known = {p.identity: p for p in (*observed, *force_owned)}
+    owned = {p.identity for p in force_owned if p.force_eligible}
+    owned.update(p.identity for p in desktop_owned_processes(list(observed)))
+    initial_desktops = {p.identity for p in observed if p.kind == "desktop"} if observed else None
+    remaining: list[CodexProcess] = []
+    force_attempted = False
+    deadline = started
+
+    def report(ok: bool, reason: str, win32_error: int | None = None) -> dict:
+        return {
+            "ok": ok, "reason": reason, "wait_seconds": timeout_seconds,
+            "elapsed_ms": round((clock() - started) * 1000),
+            "requested_windows": 0, "remaining_count": len(remaining),
+            "remaining": [{"pid": p.pid, "kind": p.kind} for p in remaining[:20]],
+            "win32_error": win32_error, "force_attempted": force_attempted,
+            "forced_count": len(terminator.terminated) if terminator else 0,
+        }
+
+    while True:
+        snapshot = query()
+        if snapshot is None:
+            return report(False, "process_query_failed")
+        if force_attempted:
+            # A child spawned while handles were being pinned must not be
+            # mistaken for an unrelated CLI after its desktop parent exits.
+            # Its ownership is uncertain: block writes, never kill a new PID.
+            spawned = [
+                p for p in snapshot if p.identity not in known and any(
+                    parent.pid == p.parent_pid and parent.started <= p.started
+                    for parent in known.values()
+                )
+            ]
+            if spawned:
+                remaining = [p for p in snapshot if p.identity in known or p in spawned]
+                return report(False, "process_tree_changed")
+        selected = related_processes(snapshot)
+        known.update((p.identity, p) for p in selected)
+        remaining = [p for p in snapshot if p.identity in known]
+        if not remaining:
+            return report(True, "forced_closed" if force_attempted else "closed")
+        desktops = {p.identity for p in remaining if p.kind == "desktop"}
+        if initial_desktops is None:
+            initial_desktops = desktops
+        elif desktops - initial_desktops:
+            return report(False, "desktop_restarted")
+        if force_attempted:
+            if clock() >= deadline:
+                return report(False, "force_exit_timeout")
+            sleep(min(0.4, max(0.0, deadline - clock())))
+            continue
+        owned.update(p.identity for p in desktop_owned_processes(snapshot))
+        if before_force is None:
+            return report(False, "force_guard_missing")
+        if any(p.identity not in owned or not p.force_eligible for p in remaining):
+            return report(False, "force_ownership_uncertain")
+        try:
+            if terminator is None:
+                terminator = WindowsProcessTerminator()
+            force_attempted = True
+            terminator.terminate(remaining, before_force)
+        except OSError as exc:
+            return report(False, "force_termination_failed", getattr(exc, "winerror", None))
+        deadline = clock() + timeout_seconds
+
+
 def close_codex_gracefully(
     timeout_seconds: float = 30,
     *,

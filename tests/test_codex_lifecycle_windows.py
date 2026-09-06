@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest.mock import Mock
 
-from backend.codex_lifecycle import CodexProcess, WindowsWindowCloser, WindowsProcessTerminator, close_codex_gracefully
+from backend.codex_lifecycle import CodexProcess, WindowsWindowCloser, WindowsProcessTerminator, close_codex_gracefully, force_close_codex
 
 
 @unittest.skipUnless(os.name == "nt", "Win32 graceful-close integration")
@@ -132,6 +132,23 @@ class WindowsCloseIntegrationTests(unittest.TestCase):
         guard.assert_called_once_with()
         self.assertFalse(terminator.terminated)
         self.assertIsNone(target.poll())
+
+
+    def test_direct_force_sends_no_wm_close_and_preserves_independent_cli(self):
+        independent, _ = self.start_fixture(kind="runtime_server")
+        for mode in ("close", "background", "ignore"):
+            with self.subTest(mode=mode):
+                target, _ = self.start_fixture(mode=mode)
+                guard = Mock()
+                result = force_close_codex(5, query=self.snapshot, before_force=guard)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(result["reason"], "forced_closed")
+                self.assertEqual(result["requested_windows"], 0)
+                self.assertEqual(result["forced_count"], 1)
+                guard.assert_called_once_with()
+                self.assertEqual(target.wait(timeout=2), 1)
+                self.assertNotIn("close_requested", target.stdout.read())
+                self.assertIsNone(independent.poll())
 
 
 if __name__ == "__main__":

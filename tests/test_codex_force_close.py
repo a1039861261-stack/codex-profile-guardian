@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from backend.codex_lifecycle import (
-    CodexProcess, close_codex_gracefully, desktop_owned_processes,
+    CodexProcess, close_codex_gracefully, force_close_codex, desktop_owned_processes,
 )
 from backend.guardian import GuardianPublicError
 from tests.test_codex_lifecycle import FakeClock, FakeCloser
@@ -200,6 +200,134 @@ class ForceCloseTests(unittest.TestCase):
         cyclic = [CodexProcess(1, 2, 1, "runtime_server", True),
                   CodexProcess(2, 1, 1, "packaged_server", True)]
         self.assertEqual(desktop_owned_processes(cyclic), [])
+
+
+
+class DirectForceCloseTests(unittest.TestCase):
+    desktop = CodexProcess(100, 1, 1000, "desktop", True)
+    server = CodexProcess(101, 100, 1001, "runtime_server", True)
+    independent = CodexProcess(200, 1, 1002, "runtime_server", True)
+
+    def close(self, query, **options):
+        clock = FakeClock()
+        terminator = options.pop("terminator", FakeTerminator())
+        guard = options.pop("before_force", Mock())
+        # Creating a window closer at all is a regression for direct force.
+        with patch("backend.codex_lifecycle.WindowsWindowCloser", side_effect=AssertionError("no window close")):
+            result = force_close_codex(
+                5, query=lambda: query(clock.now, terminator),
+                terminator=terminator, before_force=guard,
+                clock=clock, sleep=clock.sleep, **options,
+            )
+        return result, terminator, guard, clock
+
+    def test_terminates_immediately_with_no_window_request_or_pre_exit_wait(self):
+        result, terminator, guard, clock = self.close(
+            lambda now, t: [self.independent] if t.calls else [self.desktop, self.server, self.independent],
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["reason"], "forced_closed")
+        self.assertEqual(result["requested_windows"], 0)
+        self.assertEqual(result["elapsed_ms"], 0)
+        self.assertEqual(clock.now, 0)
+        self.assertEqual(terminator.calls, [[self.desktop, self.server]])
+        guard.assert_called_once_with()
+
+    def test_already_exited_does_not_terminate_or_sleep(self):
+        result, terminator, guard, clock = self.close(lambda now, t: [self.independent])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reason"], "closed")
+        self.assertFalse(terminator.calls)
+        guard.assert_not_called()
+        self.assertEqual(clock.now, 0)
+
+    def test_guard_or_ownership_absence_blocks_immediately(self):
+        for options, snapshot, reason in (
+            ({"before_force": None}, [self.desktop], "force_guard_missing"),
+            ({}, [replace(self.desktop, force_eligible=False)], "force_ownership_uncertain"),
+            ({}, None, "process_query_failed"),
+        ):
+            with self.subTest(reason=reason):
+                result, terminator, _, clock = self.close(lambda now, t: snapshot, **options)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["reason"], reason)
+                self.assertFalse(terminator.calls)
+                self.assertEqual(clock.now, 0)
+
+    def test_task_recheck_blocks_without_a_window_request_or_termination(self):
+        for code in ("codex_active_turn", "codex_turn_state_uncertain"):
+            with self.subTest(code=code):
+                terminator = FakeTerminator()
+                guard = Mock(side_effect=GuardianPublicError(code, "fixture blocked"))
+                with self.assertRaises(GuardianPublicError):
+                    self.close(lambda now, t: [self.desktop], terminator=terminator, before_force=guard)
+                guard.assert_called_once_with()
+                self.assertFalse(terminator.calls)
+
+    def test_previously_observed_orphan_is_terminated_without_a_window(self):
+        result, terminator, _, clock = self.close(
+            lambda now, t: [] if t.calls else [self.server],
+            observed=(self.server,), force_owned=(self.server,),
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(terminator.calls, [[self.server]])
+        self.assertEqual(clock.now, 0)
+
+    def test_only_post_termination_verification_waits(self):
+        clock = FakeClock()
+        terminator = FakeTerminator()
+        guard = Mock(side_effect=lambda: self.assertEqual(clock.now, 0))
+        result = force_close_codex(
+            5, query=lambda: [self.desktop], terminator=terminator, before_force=guard,
+            clock=clock, sleep=clock.sleep,
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "force_exit_timeout")
+        self.assertEqual(len(terminator.calls), 1)
+        self.assertEqual(clock.now, 5)
+        self.assertEqual(result["requested_windows"], 0)
+
+    def test_child_spawned_during_force_blocks_writes_without_killing_new_pid(self):
+        spawned = CodexProcess(102, self.desktop.pid, 1003, "runtime_server", True)
+        result, terminator, _, _ = self.close(
+            lambda now, t: [spawned] if t.calls else [self.desktop],
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "process_tree_changed")
+        self.assertEqual(result["remaining"], [{"pid": 102, "kind": "runtime_server"}])
+        self.assertEqual(terminator.calls, [[self.desktop]])
+
+    def test_new_desktop_is_not_killed_before_or_after_direct_force(self):
+        restarted = replace(self.desktop, started=9000)
+        result, terminator, _, _ = self.close(
+            lambda now, t: [restarted], observed=(self.desktop,),
+        )
+        self.assertEqual(result["reason"], "desktop_restarted")
+        self.assertFalse(terminator.calls)
+        result, terminator, _, _ = self.close(
+            lambda now, t: [restarted] if t.calls else [self.desktop],
+        )
+        self.assertEqual(result["reason"], "desktop_restarted")
+        self.assertEqual(terminator.calls, [[self.desktop]])
+
+    def test_query_or_native_failure_never_claims_a_successful_exit(self):
+        result, terminator, _, _ = self.close(
+            lambda now, t: None if t.calls else [self.desktop],
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "process_query_failed")
+        failure = OSError("private-fixture-path")
+        failure.winerror = 5
+        terminator = FakeTerminator()
+        terminator.terminate = Mock(side_effect=failure)
+        result, _, _, clock = self.close(
+            lambda now, t: [self.desktop], terminator=terminator,
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "force_termination_failed")
+        self.assertEqual(result["win32_error"], 5)
+        self.assertNotIn("private", json.dumps(result))
+        self.assertEqual(clock.now, 0)
 
 
 if __name__ == "__main__":

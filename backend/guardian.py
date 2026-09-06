@@ -46,6 +46,7 @@ from .remote_gateway_status import (
 )
 from .remote_sync import discover_remote_hosts, sync_api_profile_to_remotes, sync_official_to_remotes
 from .updater import GitHubReleaseUpdater, UpdateError
+from .history_lineage import inspect_lineage, BLOCKED_MESSAGE as HISTORY_LINEAGE_BLOCKED
 from .failover import (
     AtomicFailoverDocumentStore,
     FailoverManagementService,
@@ -56,7 +57,7 @@ from gateway.protocols.responses import normalize_protocol_compatibility
 
 
 APP_NAME = "Codex Profile Guardian"
-APP_VERSION = "1.10.7"
+APP_VERSION = "1.10.8"
 SCHEMA_VERSION = 1
 MANAGED_START = "# BEGIN CODEX PROFILE GUARDIAN MANAGED"
 MANAGED_END = "# END CODEX PROFILE GUARDIAN MANAGED"
@@ -2217,9 +2218,11 @@ class GuardianService:
             "divergent_duplicate_ids": 0,
             "duplicate_body_check_error": False,
         }
-        if result["duplicate_ids"] and not invalid:
+        if not invalid:
             try:
                 inventory = self._rollout_inventory(refuse_divergent=False)
+                result["lineage"] = self._history_lineage_status(inventory)
+                result["duplicate_ids"] = int(inventory["duplicate_ids"])
                 result["prefix_duplicate_ids"] = int(inventory["prefix_duplicate_ids"])
                 result["divergent_duplicate_ids"] = int(inventory["divergent_duplicate_ids"])
             except GuardianError:
@@ -2252,6 +2255,7 @@ class GuardianService:
                 )
             )
             and rollout_provider_ready
+            and rollouts.get("lineage", {}).get("ready", False)
         )
         profiles = self.list_profiles()
         current_profile = next((p for p in profiles if p["current"]), None)
@@ -3356,16 +3360,27 @@ class GuardianService:
                 "path": resolved,
                 "thread_id": thread_id,
                 "provider": str(payload.get("model_provider") or ""),
+                "history_mode": payload.get("history_mode"),
+                "history_base": payload.get("history_base"),
                 "archived": archived_root in resolved.parents,
                 "active": active_root in resolved.parents,
             }
             entries.append(entry)
             by_id.setdefault(thread_id, []).append(entry)
+        compressed_files = sorted(
+            set((self.codex_home / "sessions").rglob("*.jsonl.zst"))
+            | set((self.codex_home / "archived_sessions").rglob("*.jsonl.zst"))
+        )
+        lineage = inspect_lineage(entries, compressed_files)
         duplicate_ids = 0
         prefix_duplicate_ids = 0
         divergent_duplicate_ids = 0
         divergent_conflicts: list[dict[str, Any]] = []
         for thread_id, items in by_id.items():
+            # Reverts/forks retain multiple immutable rollouts for one thread.
+            # Do not offer any member of these groups for conflict isolation.
+            if thread_id in lineage["protected_thread_ids"]:
+                continue
             if len(items) < 2:
                 continue
             duplicate_ids += 1
@@ -3407,6 +3422,11 @@ class GuardianService:
                         "copies": copies,
                     }
                 )
+        if refuse_divergent and not lineage["public"]["ready"]:
+            raise GuardianPublicError(
+                "history_lineage_invalid", HISTORY_LINEAGE_BLOCKED,
+                details=lineage["public"],
+            )
         if divergent_duplicate_ids and refuse_divergent:
             raise GuardianPublicError(
                 "history_divergent_duplicates",
@@ -3416,6 +3436,8 @@ class GuardianService:
         return {
             "by_id": by_id,
             "entries": entries,
+            "lineage": lineage,
+            "compressed_files": compressed_files,
             "duplicate_ids": duplicate_ids,
             "prefix_duplicate_ids": prefix_duplicate_ids,
             "divergent_duplicate_ids": divergent_duplicate_ids,
@@ -3429,11 +3451,15 @@ class GuardianService:
             return {}
         connection = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=5)
         try:
-            rows = list(connection.execute("SELECT id, archived, rollout_path FROM threads"))
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
+            history_column = "history_mode" if "history_mode" in columns else "'legacy'"
+            rows = list(connection.execute(
+                "SELECT id, archived, rollout_path, " + history_column + " FROM threads"
+            ))
         finally:
             connection.close()
         references: dict[str, dict[str, Any]] = {}
-        for thread_id_raw, archived_raw, rollout_path_raw in rows:
+        for thread_id_raw, archived_raw, rollout_path_raw, history_mode in rows:
             resolved_path: Path | None = None
             if rollout_path_raw is not None:
                 candidate = Path(str(rollout_path_raw))
@@ -3448,8 +3474,40 @@ class GuardianService:
                 "archived": bool(int(archived_raw or 0)),
                 "raw_path": None if rollout_path_raw is None else str(rollout_path_raw),
                 "raw_archived": None if archived_raw is None else int(archived_raw),
+                "history_mode": history_mode,
             }
         return references
+
+    def _history_lineage_status(self, inventory, references=None):
+        if references is None:
+            references = self._database_rollout_references()
+        return inspect_lineage(
+            inventory["entries"], inventory.get("compressed_files", ()), references
+        )["public"]
+
+    def _require_history_lineage(self, inventory, *, target_provider=None):
+        summary = self._history_lineage_status(inventory)
+        if not summary["ready"]:
+            raise GuardianPublicError(
+                "history_lineage_invalid", HISTORY_LINEAGE_BLOCKED, details=summary
+            )
+        if target_provider is not None:
+            protected = inventory["lineage"]["protected_thread_ids"]
+            for entry in inventory["entries"]:
+                if entry["thread_id"] not in protected or entry["provider"] == target_provider:
+                    continue
+                with entry["path"].open("rb") as source:
+                    first_line = source.readline()
+                item = json.loads(first_line.decode("utf-8"))
+                item["payload"]["model_provider"] = target_provider
+                replacement = json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                capacity = len(first_line) - int(first_line.endswith(b"\n"))
+                if len(replacement) > capacity:
+                    raise GuardianPublicError(
+                        "history_lineage_header_growth",
+                        "目标线路名称会改变分页历史的字节位置，已停止切换。原聊天和引用保持不变。",
+                    )
+        return summary
 
     def _history_conflict_copy_ref(self, conflict_ref: str, item: dict[str, Any]) -> str:
         path = Path(item["path"])
@@ -3583,10 +3641,12 @@ class GuardianService:
             action_mode = "selection_required"
         else:
             action_mode = "blocked"
+        lineage = self._history_lineage_status(inventory, references)
         return {
-            "safe_to_switch": active_turns["safe"] and not conflicts,
-            "can_isolate": automatic and active_turns["safe"],
-            "can_resolve": selectable and active_turns["safe"],
+            "lineage": lineage,
+            "safe_to_switch": active_turns["safe"] and not conflicts and lineage["ready"],
+            "can_isolate": automatic and active_turns["safe"] and lineage["ready"],
+            "can_resolve": selectable and active_turns["safe"] and lineage["ready"],
             "action_mode": action_mode,
             "manual_selection_count": sum(
                 1 for conflict in conflicts if conflict["selection_required"]
@@ -3763,6 +3823,7 @@ class GuardianService:
             self._ensure_codex_closed()
             attempt["stage"] = "inventory"
             inventory = self._rollout_inventory(refuse_divergent=False)
+            self._require_history_lineage(inventory)
             conflicts = inventory["divergent_conflicts"]
             if not conflicts:
                 return {
@@ -4246,6 +4307,7 @@ class GuardianService:
     ) -> int:
         if inventory is None:
             inventory = self._rollout_inventory()
+        self._require_history_lineage(inventory, target_provider=target_provider)
         files = sorted(
             (Path(item["path"]) for item in inventory["entries"]),
             key=lambda item: str(item).lower(),
@@ -4298,6 +4360,7 @@ class GuardianService:
         # Repeated post-write/startup checks only need first-line provider state;
         # hashing large duplicate chat bodies here would make every poll expensive.
         inventory = self._rollout_inventory(verify_duplicate_bodies=False)
+        self._require_history_lineage(inventory)
         rollout_mismatches = sum(
             1 for item in inventory["entries"] if item["provider"] != target_provider
         )
@@ -4368,6 +4431,7 @@ class GuardianService:
             )
             before_archived = {row[0]: int(row[1]) for row in thread_rows}
             rollout_inventory = self._rollout_inventory()
+            self._require_history_lineage(rollout_inventory, target_provider=target_provider)
             rollout_preflight = self._validate_rollout_inventory(thread_rows, rollout_inventory)
             connection.execute("BEGIN IMMEDIATE")
             updated = connection.execute(
@@ -4480,7 +4544,8 @@ class GuardianService:
             # Refuse known divergent copies before changing config/auth or creating
             # another ordinary switch backup.  The dedicated repair flow performs
             # a full, hash-verified cold backup before isolating any branch.
-            self._rollout_inventory()
+            inventory = self._rollout_inventory()
+            self._require_history_lineage(inventory, target_provider=profile["provider_id"])
             synced_profile_id = self._sync_current_profile_environment()
             profile = self._get_profile(profile_id)
             backup = self.create_backup("before-switch")
@@ -4592,9 +4657,9 @@ class GuardianService:
                 "history.post_restart",
                 "success" if post_restart.get("verified") else "error",
                 (
-                    "Codex 启动后本地聊天 provider 复核通过"
+                    "Codex 启动后线路与历史文件依赖复核通过（未验证会话打开）"
                     if post_restart.get("verified")
-                    else "Codex 启动后本地聊天 provider 尚未通过复核"
+                    else "Codex 启动后线路或历史文件依赖尚未通过复核"
                 ),
                 checked=bool(post_restart.get("checked")),
                 database_mismatches=post_restart.get("database_provider_mismatch_count"),
@@ -4735,8 +4800,9 @@ class GuardianService:
     def repair_visibility(self) -> dict[str, Any]:
         with self.lock:
             self._ensure_codex_closed()
-            self._rollout_inventory()
+            inventory = self._rollout_inventory()
             provider, _ = self._read_config_provider()
+            self._require_history_lineage(inventory, target_provider=provider)
             backup = self.create_backup("before-shared-history-repair")
             backup_root = self.backups_dir / backup["name"]
             try:

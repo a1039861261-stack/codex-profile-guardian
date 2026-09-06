@@ -740,6 +740,8 @@ function Protection({
   const turnStateSafe = conflicts?.active_turns?.safe !== false;
   const conflictDatabaseAvailable = conflicts?.database_available !== false;
   const divergentCount = conflicts?.divergent_duplicate_id_count || 0;
+  const lineage = conflicts?.lineage;
+  const lineageBlocked = lineage?.ready === false;
   const conflictCopies = (conflicts?.conflicts || []).reduce(
     (total, item) => total + Number(item.copy_count || 0),
     0,
@@ -757,9 +759,9 @@ function Protection({
   return (
     <div className="page-stack">
       <HealthStrip status={status} />
-      <section className={`content-panel history-conflict-panel ${activeTurnCount || uncertainTurnCount || divergentCount ? "is-warning" : "is-safe"}`}>
+      <section className={`content-panel history-conflict-panel ${activeTurnCount || uncertainTurnCount || divergentCount || lineageBlocked ? "is-warning" : "is-safe"}`}>
         <div className="history-conflict-icon">
-          {conflictLoading ? <CircleNotch className="spin" weight="bold" /> : activeTurnCount || uncertainTurnCount || divergentCount ? <Warning weight="duotone" /> : <ShieldCheck weight="duotone" />}
+          {conflictLoading ? <CircleNotch className="spin" weight="bold" /> : activeTurnCount || uncertainTurnCount || divergentCount || lineageBlocked ? <Warning weight="duotone" /> : <ShieldCheck weight="duotone" />}
         </div>
         <div className="history-conflict-copy">
           <span className="eyebrow">切换前安全检查</span>
@@ -776,6 +778,17 @@ function Protection({
             ) : (
               <><h2>无法确认最近任务是否已经结束</h2><p>Guardian 已按安全规则停止切换。请等待界面停止输出并正常退出 Codex，再刷新检测。</p></>
             )
+          ) : lineageBlocked ? (
+            <>
+              <h2>聊天历史依赖异常，已停止切换</h2>
+              <p>{lineage.message}</p>
+              <div className="conflict-summary">
+                {lineage.issue_counts?.missing_source_rollout ? <span>{lineage.issue_counts.missing_source_rollout} 个源历史缺失</span> : null}
+                {lineage.issue_counts?.missing_current_rollout ? <span>{lineage.issue_counts.missing_current_rollout} 个当前历史路径失效</span> : null}
+                {lineage.compressed_rollout_count ? <span>{lineage.compressed_rollout_count} 个压缩历史文件待兼容</span> : null}
+                <span>未修改聊天文件</span>
+              </div>
+            </>
           ) : divergentCount ? (
             <>
               <h2>发现 {divergentCount} 组同 ID 聊天正文分叉</h2>
@@ -790,6 +803,11 @@ function Protection({
                 <span>{conflicts?.can_isolate ? "可自动保留" : conflicts?.can_resolve ? "需选择保留副本" : "缺少 SQLite，已停止"}</span>
                 {interruptedTurnCount ? <span>{interruptedTurnCount} 个已中断任务标记</span> : null}
               </div>
+            </>
+          ) : lineage?.paginated_rollout_count ? (
+            <>
+              <h2>分页历史依赖检查通过</h2>
+              <p>已保留 {lineage.protected_rollout_count} 个关联历史文件，不作为冲突副本隔离。会话能否打开仍需在 Codex 中确认。</p>
             </>
           ) : interruptedTurnCount ? (
             <>

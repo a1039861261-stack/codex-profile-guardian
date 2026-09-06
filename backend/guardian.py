@@ -3556,6 +3556,126 @@ class GuardianService:
         report_revision: str | None = None,
         selections: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        # Per-call state: concurrent requests must never share repair diagnostics.
+        attempt: dict[str, Any] = {
+            "stage": "validation",
+            "diagnostic_id": uuid.uuid4().hex[:12],
+            "cold_backup_complete": False,
+            "history_writes_started": False,
+            "history_result_verified": False,
+            "recovery": "not_needed",
+        }
+        try:
+            return self._resolve_history_conflicts(
+                confirmed=confirmed,
+                report_revision=report_revision,
+                selections=selections,
+                attempt=attempt,
+            )
+        except Exception as exc:
+            failure = self._history_conflict_failure(exc, attempt)
+            try:
+                self._log(
+                    "history.conflict_isolate",
+                    "error",
+                    f"{failure.public_message} [{failure.code}]",
+                    code=failure.code,
+                    **failure.details,
+                )
+            except Exception:
+                # A full/read-only disk must not hide the original safe diagnosis.
+                failure.details["audit_log_written"] = False
+                failure.public_message += " 操作日志写入失败，请保存此提示。"
+                failure.args = (failure.public_message,)
+            raise failure from None
+
+    @staticmethod
+    def _history_conflict_failure(
+        exc: Exception, attempt: dict[str, Any]
+    ) -> GuardianPublicError:
+        stages = {
+            "validation": "参数检查",
+            "codex_close": "Codex 安全退出",
+            "inventory": "聊天副本检查",
+            "selection": "保留副本确认",
+            "cold_backup": "完整冷备",
+            "database_preflight": "SQLite 前置检查",
+            "quarantine_prepare": "隔离副本准备",
+            "quarantine_apply": "聊天副本隔离",
+            "database_update": "SQLite 引用更新",
+            "verification": "处理结果复核",
+            "completion": "结果记录",
+        }
+        stage = str(attempt["stage"])
+        details = dict(attempt)
+        details["audit_log_written"] = True
+        retryable = False
+        if isinstance(exc, GuardianPublicError):
+            code = exc.code
+            message = exc.public_message
+            # GuardianPublicError already has a bounded, public-only contract.
+            details = {**exc.details, **details}
+            retryable = exc.retryable
+        else:
+            code = f"history_conflict_{stage}_failed"
+            message = f"聊天冲突处理在{stages[stage]}阶段失败。"
+            known = {
+                "聊天冲突隔离需要明确确认。": "confirmation_required",
+                "聊天冲突副本选择参数无效。": "selection_invalid",
+                "聊天冲突检测版本参数无效。": "revision_invalid",
+                "当前聊天冲突不需要人工选择副本。": "selection_unexpected",
+                "完整冷备前发现无法解析的会话 JSONL，已停止处理。": "jsonl_invalid",
+                "完整冷备前发现空会话文件，已停止处理。": "jsonl_empty",
+                "完整冷备期间源文件发生变化或副本哈希不一致，已停止处理。": "backup_source_changed",
+                "完整冷备 SQLite 复核失败，已停止处理。": "backup_database_invalid",
+                "聊天冲突隔离前 SQLite threads 结构不兼容。": "database_schema_incompatible",
+                "聊天冲突隔离前发现 threads 触发器，已停止自动处理。": "database_triggers_present",
+                "聊天冲突隔离前 SQLite 完整性检查失败。": "database_integrity_failed",
+            }
+            # Match fixed messages only; unknown exceptions may contain secrets,
+            # paths, SQL, conversation text, or third-party responses.
+            reason = str(exc) if isinstance(exc, GuardianError) else ""
+            if reason in known:
+                code = "history_conflict_" + known[reason]
+                message = reason
+            elif isinstance(exc, PermissionError):
+                code = "history_conflict_permission_denied"
+                message = f"{stages[stage]}时访问被拒绝，请检查文件权限或安全软件拦截。"
+            elif isinstance(exc, sqlite3.Error):
+                code = "history_conflict_database_error"
+                message = f"{stages[stage]}时 SQLite 无法完成检查或操作，请保留现有数据库。"
+        if attempt["history_result_verified"]:
+            code = "history_conflict_result_record_failed"
+            message = "聊天处理结果已通过复核，但结果记录失败。请保留冷备并重新检测，不要重复处理。"
+            retryable = False
+        elif attempt["recovery"] == "incomplete":
+            code = "history_conflict_rollback_incomplete"
+            message = "聊天冲突处理失败且自动恢复未完全通过，请保持 Codex 关闭并使用完整冷备恢复。"
+            retryable = False
+        elif attempt["recovery"] == "unverified":
+            code = "history_conflict_rollback_unverified"
+            message = "聊天冲突处理失败，恢复结果无法确认，请保持 Codex 关闭并保留完整冷备和隔离副本。"
+            retryable = False
+        elif not attempt["history_writes_started"]:
+            message += " 未移动聊天或修改会话数据库。"
+            message += " 完整冷备已完成并保留。" if attempt["cold_backup_complete"] else " 完整冷备尚未确认完成。"
+        elif attempt["recovery"] == "restored":
+            message += " 已尝试恢复原路径和数据库引用，请保留完整冷备与隔离副本。"
+            retryable = False
+        else:
+            message += " 已进入聊天写入阶段，结果尚未确认，请保持 Codex 关闭并保留冷备。"
+            retryable = False
+        message += f"（诊断码：{attempt['diagnostic_id']}）"
+        return GuardianPublicError(code, message, details=details, retryable=retryable)
+
+    def _resolve_history_conflicts(
+        self,
+        *,
+        confirmed: bool,
+        report_revision: str | None,
+        selections: list[dict[str, Any]] | None,
+        attempt: dict[str, Any],
+    ) -> dict[str, Any]:
         """Cold-back up every copy, keep an explicit canonical copy, and quarantine the rest."""
         if not confirmed:
             raise GuardianError("聊天冲突隔离需要明确确认。")
@@ -3578,7 +3698,9 @@ class GuardianService:
                     raise GuardianError("聊天冲突副本选择参数无效。")
                 selection_map[conflict_ref] = keep_copy_ref
         with self.lock:
+            attempt["stage"] = "codex_close"
             self._ensure_codex_closed()
+            attempt["stage"] = "inventory"
             inventory = self._rollout_inventory(refuse_divergent=False)
             conflicts = inventory["divergent_conflicts"]
             if not conflicts:
@@ -3599,6 +3721,7 @@ class GuardianService:
                     "聊天冲突处理前检测到 Codex 任务状态变化。Guardian 未修改任何文件，请结束任务后重新检测。",
                     retryable=True,
                 )
+            attempt["stage"] = "selection"
             manual_refs = {
                 item["conflict_ref"]
                 for item in current_report["conflicts"]
@@ -3698,7 +3821,10 @@ class GuardianService:
                     }
                 )
 
+            attempt["stage"] = "cold_backup"
             cold_backup = self.create_history_cold_backup("before-conflict-isolation")
+            attempt["cold_backup_complete"] = True
+            attempt["stage"] = "database_preflight"
             timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             quarantine_root = self.history_conflicts_dir / f"{timestamp}-divergent-history"
             quarantine_root.mkdir(parents=True, exist_ok=False)
@@ -3763,6 +3889,7 @@ class GuardianService:
             removed: list[tuple[Path, Path, str]] = []
             database_committed = False
             try:
+                attempt["stage"] = "quarantine_prepare"
                 active_root = (self.codex_home / "sessions").resolve()
                 archived_root = (self.codex_home / "archived_sessions").resolve()
                 for item in plan:
@@ -3800,12 +3927,15 @@ class GuardianService:
                         "files": copied,
                     },
                 )
+                attempt["stage"] = "quarantine_apply"
                 for source, _, expected_hash in removed:
                     if sha256(source) != expected_hash:
                         raise GuardianError("聊天冲突源文件在隔离前发生变化，已停止处理。")
+                    attempt["history_writes_started"] = True
                     source.unlink()
 
                 if database_changes:
+                    attempt["stage"] = "database_update"
                     connection = sqlite3.connect(db, timeout=30)
                     connection.execute("PRAGMA busy_timeout=30000")
                     try:
@@ -3834,6 +3964,7 @@ class GuardianService:
                     finally:
                         connection.close()
 
+                attempt["stage"] = "verification"
                 after_inventory = self._rollout_inventory(refuse_divergent=False)
                 if after_inventory["divergent_duplicate_ids"]:
                     raise GuardianError("聊天冲突隔离后仍存在正文分叉，已停止处理。")
@@ -3858,12 +3989,15 @@ class GuardianService:
                     raise GuardianError("聊天冲突隔离后 SQLite 状态与选择结果不一致，已停止处理。")
                 if (sha256(index_path) if index_path.is_file() else None) != index_hash:
                     raise GuardianError("聊天冲突隔离后会话索引发生变化，已停止处理。")
+                attempt["stage"] = "completion"
                 manifest_path = quarantine_root / "manifest.json"
                 manifest = read_json_file(manifest_path)
                 manifest["state"] = "complete"
                 manifest["completed_at"] = utc_now()
                 atomic_json(manifest_path, manifest)
+                attempt["history_result_verified"] = True
             except Exception as exc:
+                attempt["recovery"] = "unverified"
                 restore_failed = False
                 for source, destination, expected_hash in reversed(removed):
                     if source.exists():
@@ -3913,6 +4047,7 @@ class GuardianService:
                     except Exception:
                         database_restore_failed = True
                         restore_failed = True
+                attempt["recovery"] = "incomplete" if restore_failed else "restored"
                 atomic_json(
                     quarantine_root / "INCOMPLETE.json",
                     {
@@ -3923,18 +4058,11 @@ class GuardianService:
                         "cold_backup": cold_backup["name"],
                     },
                 )
-                self._log(
-                    "history.conflict_isolate",
-                    "error",
-                    "聊天冲突隔离失败，已尝试恢复原路径；完整冷备和隔离副本均已保留",
-                    restore_failed=restore_failed,
-                    database_restore_failed=database_restore_failed,
-                    cold_backup=cold_backup["name"],
-                )
                 if restore_failed:
                     raise GuardianError("聊天冲突隔离失败且自动恢复未完全通过；请保持 Codex 关闭并使用完整冷备恢复。") from exc
                 raise
 
+            attempt["stage"] = "completion"
             self._log(
                 "history.conflict_isolate",
                 "success",

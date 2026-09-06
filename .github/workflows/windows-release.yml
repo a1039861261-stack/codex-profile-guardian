@@ -58,6 +58,15 @@ jobs:
         run: .\tools\build-release.ps1 -IsolatedHostedRunner
       - name: Verify release assets and provenance
         run: .\tools\verify-release-assets.ps1 -OutputRoot output -ExpectedCommit $env:GITHUB_SHA
+      - name: Isolated conflict-diagnostic browser acceptance
+        run: |
+          Get-Command npx.cmd -ErrorAction Stop | Out-Null
+          .\.venv\Scripts\python.exe -m pip install playwright==1.55.0
+          if ($LASTEXITCODE -ne 0) { throw 'Browser acceptance dependency failed' }
+          .\.venv\Scripts\python.exe -m playwright install chromium
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated browser install failed' }
+          .\.venv\Scripts\python.exe tools/verify-history-conflict-ui.py
+          if ($LASTEXITCODE -ne 0) { throw 'Conflict diagnostic UI acceptance failed' }
       - name: Retain only the four public release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

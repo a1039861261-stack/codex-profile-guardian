@@ -730,7 +730,7 @@ class GuardianServiceTests(unittest.TestCase):
             return original_atomic_json(path, payload)
 
         with patch.object(guardian_module, "atomic_json", side_effect=fail_complete_manifest):
-            with self.assertRaisesRegex(GuardianError, "fixture late completion failure"):
+            with self.assertRaisesRegex(GuardianPublicError, "结果记录阶段失败"):
                 self.service.resolve_history_conflicts(
                     confirmed=True,
                     report_revision=report["report_revision"],
@@ -902,7 +902,7 @@ class GuardianServiceTests(unittest.TestCase):
             return original_inventory(*args, **kwargs)
 
         with patch.object(self.service, "_rollout_inventory", side_effect=fail_second_inventory):
-            with self.assertRaisesRegex(GuardianError, "fixture post-isolation failure"):
+            with self.assertRaisesRegex(GuardianPublicError, "处理结果复核阶段失败"):
                 self.service.resolve_history_conflicts(confirmed=True)
 
         self.assertEqual(duplicate.read_bytes(), branch)
@@ -930,7 +930,7 @@ class GuardianServiceTests(unittest.TestCase):
             return original_atomic_json(path, payload)
 
         with patch.object(guardian_module, "atomic_json", side_effect=fail_complete_manifest):
-            with self.assertRaisesRegex(GuardianError, "fixture completion manifest failure"):
+            with self.assertRaisesRegex(GuardianPublicError, "结果记录阶段失败"):
                 self.service.resolve_history_conflicts(confirmed=True)
 
         self.assertEqual(duplicate.read_bytes(), branch)

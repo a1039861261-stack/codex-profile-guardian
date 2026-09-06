@@ -63,9 +63,9 @@ def verify(browser, width, height):
             expect(page.get_by_text("1 个源历史缺失", exact=True)).to_be_visible()
             expect(page.get_by_role("button", name="打开隔离库", exact=True)).to_be_enabled()
             response = context.request.post(
-                origin + "/api/protection/conflicts/isolate", data={"confirmed": True}, headers={"Origin": origin},
+                origin + "/api/protection/conflicts/isolate", data={"confirm": True}, headers={"Origin": origin},
             )
-            assert response.status == 409, response.status
+            assert response.status == 409, response.json()
             assert response.json()["error"]["code"] == "history_lineage_invalid", response.json()
             assert fixture.hashes() == missing_before
             assert page.evaluate("document.documentElement.scrollWidth") <= width + 1

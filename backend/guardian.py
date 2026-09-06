@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import ctypes
 from ctypes import wintypes
 import datetime as dt
@@ -55,7 +56,7 @@ from gateway.protocols.responses import normalize_protocol_compatibility
 
 
 APP_NAME = "Codex Profile Guardian"
-APP_VERSION = "1.10.6"
+APP_VERSION = "1.10.7"
 SCHEMA_VERSION = 1
 MANAGED_START = "# BEGIN CODEX PROFILE GUARDIAN MANAGED"
 MANAGED_END = "# END CODEX PROFILE GUARDIAN MANAGED"
@@ -67,6 +68,45 @@ ACTIVE_TURN_MAX_SCAN_BYTES = 512 * 1024 * 1024
 
 class GuardianError(RuntimeError):
     pass
+
+
+
+HISTORY_CONFLICT_UPDATE_SQL = (
+    "UPDATE threads SET archived=?, rollout_path=? "
+    "WHERE id=? AND archived IS ? AND rollout_path IS ?"
+)
+HISTORY_CONFLICT_TRIGGER_MESSAGE = (
+    "聊天冲突处理发现会影响本次修改的 threads 触发器，已停止自动处理。"
+)
+
+
+@contextmanager
+def _guard_history_conflict_sql(connection):
+    """Reject trigger/view programs while compiling the exact conflict UPDATE.
+
+    Codex's INSERT and UPDATE OF timestamp triggers are unrelated to the two
+    columns we change. Let SQLite resolve events/columns instead of parsing SQL
+    or trusting a trigger name. Keep this callback installed through execution
+    so schema-triggered re-preparation has the same protection.
+    """
+    trigger_blocked = False
+
+    def authorize(action, argument1, argument2, database, source):
+        nonlocal trigger_blocked
+        if source is not None:
+            trigger_blocked = True
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    connection.set_authorizer(authorize)
+    try:
+        yield
+    except sqlite3.DatabaseError:
+        if trigger_blocked:
+            raise GuardianError(HISTORY_CONFLICT_TRIGGER_MESSAGE) from None
+        raise
+    finally:
+        connection.set_authorizer(None)
 
 
 class GuardianPublicError(GuardianError):
@@ -3650,7 +3690,7 @@ class GuardianService:
                 "完整冷备期间源文件发生变化或副本哈希不一致，已停止处理。": "backup_source_changed",
                 "完整冷备 SQLite 复核失败，已停止处理。": "backup_database_invalid",
                 "聊天冲突隔离前 SQLite threads 结构不兼容。": "database_schema_incompatible",
-                "聊天冲突隔离前发现 threads 触发器，已停止自动处理。": "database_triggers_present",
+                HISTORY_CONFLICT_TRIGGER_MESSAGE: "database_triggers_present",
                 "聊天冲突隔离前 SQLite 完整性检查失败。": "database_integrity_failed",
             }
             # Match fixed messages only; unknown exceptions may contain secrets,
@@ -3860,13 +3900,14 @@ class GuardianService:
                 required_columns = {"id", "archived", "rollout_path", "model_provider"}
                 if not required_columns.issubset(thread_columns):
                     raise GuardianError("聊天冲突隔离前 SQLite threads 结构不兼容。")
-                thread_trigger_count = int(
+                # EXPLAIN compiles the same UPDATE (including applicable trigger
+                # programs) without writing rows. Do not inspect its unstable VM
+                # output; the authorizer is the gate. Bind no private values.
+                with _guard_history_conflict_sql(connection):
                     connection.execute(
-                        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name='threads'"
-                    ).fetchone()[0]
-                )
-                if thread_trigger_count:
-                    raise GuardianError("聊天冲突隔离前发现 threads 触发器，已停止自动处理。")
+                        "EXPLAIN " + HISTORY_CONFLICT_UPDATE_SQL,
+                        (None, None, None, None, None),
+                    ).fetchall()
                 before_rows = list(
                     connection.execute("SELECT * FROM threads ORDER BY id")
                 )
@@ -3960,25 +4001,25 @@ class GuardianService:
                     connection = sqlite3.connect(db, timeout=30)
                     connection.execute("PRAGMA busy_timeout=30000")
                     try:
-                        connection.execute("BEGIN IMMEDIATE")
-                        for change in database_changes:
-                            updated = connection.execute(
-                                "UPDATE threads SET archived=?, rollout_path=? "
-                                "WHERE id=? AND archived IS ? AND rollout_path IS ?",
-                                (
-                                    change["after_archived"],
-                                    change["after_path"],
-                                    change["thread_id"],
-                                    change["before_archived"],
-                                    change["before_path"],
-                                ),
-                            ).rowcount
-                            if updated != 1:
-                                raise GuardianError("聊天冲突处理前 SQLite 引用发生变化，已停止处理。")
-                        if str(connection.execute("PRAGMA integrity_check").fetchone()[0]) != "ok":
-                            raise GuardianError("聊天冲突处理时 SQLite 完整性检查失败。")
-                        connection.commit()
-                        database_committed = True
+                        with _guard_history_conflict_sql(connection):
+                            connection.execute("BEGIN IMMEDIATE")
+                            for change in database_changes:
+                                updated = connection.execute(
+                                    HISTORY_CONFLICT_UPDATE_SQL,
+                                    (
+                                        change["after_archived"],
+                                        change["after_path"],
+                                        change["thread_id"],
+                                        change["before_archived"],
+                                        change["before_path"],
+                                    ),
+                                ).rowcount
+                                if updated != 1:
+                                    raise GuardianError("聊天冲突处理前 SQLite 引用发生变化，已停止处理。")
+                            if str(connection.execute("PRAGMA integrity_check").fetchone()[0]) != "ok":
+                                raise GuardianError("聊天冲突处理时 SQLite 完整性检查失败。")
+                            connection.commit()
+                            database_committed = True
                     except Exception:
                         connection.rollback()
                         raise
@@ -4036,30 +4077,30 @@ class GuardianService:
                         connection = sqlite3.connect(db, timeout=30)
                         connection.execute("PRAGMA busy_timeout=30000")
                         try:
-                            connection.execute("BEGIN IMMEDIATE")
-                            for change in reversed(database_changes):
-                                restored = connection.execute(
-                                    "UPDATE threads SET archived=?, rollout_path=? "
-                                    "WHERE id=? AND archived IS ? AND rollout_path IS ?",
-                                    (
-                                        change["before_archived"],
-                                        change["before_path"],
-                                        change["thread_id"],
-                                        change["after_archived"],
-                                        change["after_path"],
-                                    ),
-                                ).rowcount
-                                if restored != 1:
-                                    raise GuardianError("SQLite 引用自动恢复条件不匹配。")
-                            restored_rows = list(
-                                connection.execute("SELECT * FROM threads ORDER BY id")
-                            )
-                            restored_integrity = str(
-                                connection.execute("PRAGMA integrity_check").fetchone()[0]
-                            )
-                            if restored_rows != before_rows or restored_integrity != "ok":
-                                raise GuardianError("SQLite 引用自动恢复复核失败。")
-                            connection.commit()
+                            with _guard_history_conflict_sql(connection):
+                                connection.execute("BEGIN IMMEDIATE")
+                                for change in reversed(database_changes):
+                                    restored = connection.execute(
+                                        HISTORY_CONFLICT_UPDATE_SQL,
+                                        (
+                                            change["before_archived"],
+                                            change["before_path"],
+                                            change["thread_id"],
+                                            change["after_archived"],
+                                            change["after_path"],
+                                        ),
+                                    ).rowcount
+                                    if restored != 1:
+                                        raise GuardianError("SQLite 引用自动恢复条件不匹配。")
+                                restored_rows = list(
+                                    connection.execute("SELECT * FROM threads ORDER BY id")
+                                )
+                                restored_integrity = str(
+                                    connection.execute("PRAGMA integrity_check").fetchone()[0]
+                                )
+                                if restored_rows != before_rows or restored_integrity != "ok":
+                                    raise GuardianError("SQLite 引用自动恢复复核失败。")
+                                connection.commit()
                         except Exception:
                             connection.rollback()
                             raise

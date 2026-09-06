@@ -12,7 +12,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $AppName = "Codex Profile Guardian"
-$Version = "1.10.6"
+$Version = "1.10.7"
 $GatewayVersion = "v$Version"
 $TaskName = "Codex Profile Guardian Gateway"
 $DataPort = 18766

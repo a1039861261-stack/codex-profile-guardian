@@ -116,6 +116,9 @@ class HistoryConflictDiagnosticsTests(unittest.TestCase):
                     return Cursor()
                 return self.inner.execute(sql, *args)
 
+            def set_authorizer(self, callback):
+                self.inner.set_authorizer(callback)
+
             def close(self):
                 self.inner.close()
 

@@ -1,4 +1,4 @@
-"""Graceful Windows desktop shutdown. Never terminate a process or a CLI tree."""
+"""Bounded Windows desktop shutdown with an explicitly guarded force fallback."""
 from __future__ import annotations
 
 import ctypes
@@ -32,6 +32,7 @@ try {
     $rows=@(foreach($item in $all) {
         if (-not $item.ExecutablePath) { throw 'identity_unavailable' }
         $desktop=@($item | Where-Object { __DESKTOP_FILTER__ }).Count -gt 0
+        $trustedDesktop=$desktop -and $item.ExecutablePath -match '\\WindowsApps\\OpenAI\.Codex_[^\\]+\\app\\(ChatGPT|Codex)\.exe$'
         $packaged=$item.ExecutablePath -match '\\WindowsApps\\OpenAI\.Codex_[^\\]+\\app\\resources\\codex\.exe$'
         $server=$item.Name -ieq 'codex.exe' -and $item.CommandLine -match '(^|\s)app-server(\s|$)' -and ($packaged -or $item.ExecutablePath -match $runtime)
         if (-not $desktop -and -not $server) { continue }
@@ -44,7 +45,7 @@ try {
             $kind=if ($desktop) {
                 if ($item.CommandLine -match '(^|\s)--type[=\s]') { 'desktop_child' } else { 'desktop' }
             } elseif ($packaged) { 'packaged_server' } else { 'runtime_server' }
-            [ordered]@{ pid=[int]$item.ProcessId; parent_pid=[int]$item.ParentProcessId; started=$started; kind=$kind }
+            [ordered]@{ pid=[int]$item.ProcessId; parent_pid=[int]$item.ParentProcessId; started=$started; kind=$kind; force_eligible=[bool]($trustedDesktop -or $server) }
         } catch {
             # Disappearance during shutdown is normal, but an unreadable live
             # process or a reused PID must still fail closed.
@@ -63,6 +64,7 @@ class CodexProcess:
     parent_pid: int
     started: int
     kind: str
+    force_eligible: bool = False
 
     @property
     def identity(self) -> tuple[int, int]:
@@ -88,10 +90,11 @@ def query_codex_processes() -> list[CodexProcess] | None:
                 not isinstance(row, dict)
                 or any(type(row.get(key)) is not int for key in ("pid", "parent_pid", "started"))
                 or row["pid"] <= 0 or row["parent_pid"] < 0 or row["started"] <= 0
+                or type(row.get("force_eligible")) is not bool
                 or row.get("kind") not in {"desktop", "desktop_child", "packaged_server", "runtime_server"}
             ):
                 return None
-            processes.append(CodexProcess(row["pid"], row["parent_pid"], row["started"], row["kind"]))
+            processes.append(CodexProcess(row["pid"], row["parent_pid"], row["started"], row["kind"], row["force_eligible"]))
         if len({p.pid for p in processes}) != len(processes):
             return None
         return processes
@@ -120,6 +123,33 @@ def related_processes(processes: list[CodexProcess]) -> list[CodexProcess]:
             seen.add(parent.pid)
             child = parent
     return related
+
+
+def desktop_owned_processes(processes: list[CodexProcess]) -> list[CodexProcess]:
+    """Force requires a verified desktop root and a consistent live parent chain.
+
+    A packaged app-server by itself may be an independent CLI. Its path alone
+    does not authorize termination. Remember proven identities before closing
+    windows so genuine children remain owned after their parent exits.
+    """
+    by_pid = {p.pid: p for p in processes}
+    owned = []
+    for process in processes:
+        if not process.force_eligible:
+            continue
+        child = process
+        seen = {child.pid}
+        while True:
+            if child.kind == "desktop":
+                owned.append(process)
+                break
+            parent = by_pid.get(child.parent_pid)
+            if (parent is None or not parent.force_eligible
+                    or parent.pid in seen or parent.started > child.started):
+                break
+            seen.add(parent.pid)
+            child = parent
+    return owned
 
 
 class WindowsWindowCloser:
@@ -199,19 +229,85 @@ class WindowsWindowCloser:
             self.kernel32.CloseHandle(handle)
 
 
+class WindowsProcessTerminator:
+    """Pin and validate the entire allowlist before terminating any instance."""
+
+    def __init__(self) -> None:
+        self.terminated: set[tuple[int, int]] = set()
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        signatures = (
+            (self.kernel32.OpenProcess, [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+            (self.kernel32.CloseHandle, [wintypes.HANDLE], wintypes.BOOL),
+            (self.kernel32.WaitForSingleObject, [wintypes.HANDLE, wintypes.DWORD], wintypes.DWORD),
+            (self.kernel32.GetProcessTimes, [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4, wintypes.BOOL),
+            (self.kernel32.TerminateProcess, [wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+        )
+        for function, arguments, result in signatures:
+            function.argtypes, function.restype = arguments, result
+
+    def terminate(self, processes: list[CodexProcess], guard: Callable[[], None]) -> None:
+        handles = []
+        try:
+            for process in processes:
+                if not process.force_eligible:
+                    raise OSError(0, "process_identity_untrusted")
+                # Exact handles, not image names, recursive trees or later PID
+                # lookups. Keep every handle open across validation and action.
+                handle = self.kernel32.OpenProcess(0x1000 | 0x100000 | 0x0001, False, process.pid)
+                if not handle:
+                    code = ctypes.get_last_error()
+                    if code == 87:
+                        continue
+                    raise ctypes.WinError(code)
+                handles.append((process, handle))
+                created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+                if not self.kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                if (created.dwHighDateTime << 32 | created.dwLowDateTime) != process.started:
+                    raise OSError(0, "process_identity_changed")
+            # Recheck task state after all handles are pinned, immediately
+            # before any termination. Failure propagates without killing.
+            guard()
+            # Stop the desktop parent first to limit creation of new children.
+            for process, handle in sorted(handles, key=lambda item: item[0].kind != "desktop"):
+                state = self.kernel32.WaitForSingleObject(handle, 0)
+                if state == 0:
+                    continue
+                if state != 258:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                if not self.kernel32.TerminateProcess(handle, 1):
+                    code = ctypes.get_last_error()
+                    if self.kernel32.WaitForSingleObject(handle, 0) == 0:
+                        continue
+                    raise ctypes.WinError(code)
+                self.terminated.add(process.identity)
+        finally:
+            for _process, handle in handles:
+                self.kernel32.CloseHandle(handle)
+
+
 def close_codex_gracefully(
     timeout_seconds: float = 30,
     *,
     query: Callable[[], list[CodexProcess] | None] = query_codex_processes,
     observed: tuple[CodexProcess, ...] = (),
     closer: WindowsWindowCloser | None = None,
+    force_after_timeout: bool = False,
+    before_force: Callable[[], None] | None = None,
+    force_owned: tuple[CodexProcess, ...] = (),
+    terminator: WindowsProcessTerminator | None = None,
+    force_timeout_seconds: float = 5,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict:
     started = clock()
+    force_timeout_seconds = max(1.0, min(15.0, float(force_timeout_seconds)))
+    force_attempted = False
+    owned = {p.identity for p in force_owned if p.force_eligible}
+    owned.update(p.identity for p in desktop_owned_processes(list(observed)))
     timeout_seconds = max(1.0, min(60.0, float(timeout_seconds)))
     deadline = started + timeout_seconds
-    known = {p.identity for p in observed}
+    known = {p.identity for p in (*observed, *force_owned)}
     initial_desktops = {p.identity for p in observed if p.kind == "desktop"} if observed else None
     remaining: list[CodexProcess] = []
 
@@ -223,6 +319,8 @@ def close_codex_gracefully(
             "remaining_count": len(remaining),
             "remaining": [{"pid": p.pid, "kind": p.kind} for p in remaining[:20]],
             "win32_error": win32_error,
+            "force_attempted": force_attempted,
+            "forced_count": len(terminator.terminated) if terminator else 0,
         }
 
     while True:
@@ -231,19 +329,42 @@ def close_codex_gracefully(
             return report(False, "process_query_failed")
         selected = related_processes(snapshot)
         known.update(p.identity for p in selected)
+        if not force_attempted:
+            owned.update(p.identity for p in desktop_owned_processes(snapshot))
         # Keep already-observed children even after the desktop parent exits.
         # A later, independent CLI with a recycled PID is NOT the same child.
         remaining = [p for p in snapshot if p.identity in known]
         if not remaining:
-            return report(True, "closed")
+            return report(True, "forced_closed" if force_attempted else "closed")
         desktops = {p.identity for p in remaining if p.kind == "desktop"}
         if initial_desktops is None:
             initial_desktops = desktops
         elif desktops - initial_desktops:
             return report(False, "desktop_restarted")
+        if force_attempted:
+            if clock() >= deadline:
+                return report(False, "force_exit_timeout")
+            sleep(min(0.4, max(0.0, deadline - clock())))
+            continue
         if clock() >= deadline:
             reason = "exit_timeout" if closer and closer.sent else "window_disabled" if closer and closer.disabled_windows else "no_close_window"
-            return report(False, reason)
+            if not force_after_timeout:
+                return report(False, reason)
+            if closer and closer.disabled_windows:
+                return report(False, "window_disabled")
+            if before_force is None:
+                return report(False, "force_guard_missing")
+            if any(p.identity not in owned or not p.force_eligible for p in remaining):
+                return report(False, "force_ownership_uncertain")
+            try:
+                if terminator is None:
+                    terminator = WindowsProcessTerminator()
+                force_attempted = True
+                terminator.terminate(remaining, before_force)
+            except OSError as exc:
+                return report(False, "force_termination_failed", getattr(exc, "winerror", None))
+            deadline = clock() + force_timeout_seconds
+            continue
         try:
             if closer is None:
                 closer = WindowsWindowCloser()

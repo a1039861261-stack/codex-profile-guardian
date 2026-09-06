@@ -57,7 +57,7 @@ def main():
             return 0
         if message == 0x0002:
             remaining -= 1
-            if not remaining:
+            if not remaining and mode != "background":
                 user.PostQuitMessage(0)
             return 0
         return user.DefWindowProcW(hwnd, message, wparam, lparam)

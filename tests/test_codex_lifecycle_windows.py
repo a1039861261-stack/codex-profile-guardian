@@ -7,8 +7,9 @@ import sys
 import threading
 import time
 import unittest
+from unittest.mock import Mock
 
-from backend.codex_lifecycle import CodexProcess, WindowsWindowCloser, close_codex_gracefully
+from backend.codex_lifecycle import CodexProcess, WindowsWindowCloser, WindowsProcessTerminator, close_codex_gracefully
 
 
 @unittest.skipUnless(os.name == "nt", "Win32 graceful-close integration")
@@ -39,7 +40,7 @@ class WindowsCloseIntegrationTests(unittest.TestCase):
         self.assertTrue(line, "isolated test window did not start")
         data = json.loads(line)
         self.assertEqual(data["pid"], process.pid)
-        identity = CodexProcess(process.pid, os.getpid(), data["started"], kind)
+        identity = CodexProcess(process.pid, os.getpid(), data["started"], kind, True)
         self.fixtures[-1] = (process, identity)
         return process, identity
 
@@ -83,6 +84,54 @@ class WindowsCloseIntegrationTests(unittest.TestCase):
         self.assertEqual(result["reason"], "window_close_failed")
         self.assertEqual(result["requested_windows"], 0)
         self.assertIsNone(process.poll())
+
+
+    def test_background_survives_window_close_then_guarded_force_exits_it(self):
+        target, _ = self.start_fixture(mode="background")
+        independent, _ = self.start_fixture(kind="runtime_server")
+        guard = Mock()
+        result = close_codex_gracefully(
+            1, query=self.snapshot, force_after_timeout=True, before_force=guard,
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["reason"], "forced_closed")
+        self.assertEqual(result["forced_count"], 1)
+        self.assertEqual(result["requested_windows"], 1)
+        guard.assert_called_once_with()
+        self.assertEqual(target.wait(timeout=2), 1)
+        self.assertIsNone(independent.poll())
+
+    def test_refusing_window_can_be_forced_only_after_task_guard(self):
+        target, _ = self.start_fixture(mode="ignore")
+        result = close_codex_gracefully(
+            1, query=self.snapshot, force_after_timeout=True, before_force=lambda: None,
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["forced_count"], 1)
+        self.assertEqual(target.wait(timeout=2), 1)
+
+    def test_batch_identity_mismatch_never_terminates_even_first_valid_process(self):
+        first, identity = self.start_fixture(mode="ignore")
+        second, other = self.start_fixture(mode="ignore")
+        wrong = CodexProcess(other.pid, other.parent_pid, other.started + 1, "desktop", True)
+        terminator = WindowsProcessTerminator()
+        guard = Mock()
+        with self.assertRaises(OSError):
+            terminator.terminate([identity, wrong], guard)
+        self.assertFalse(terminator.terminated)
+        guard.assert_not_called()
+        self.assertIsNone(first.poll())
+        self.assertIsNone(second.poll())
+
+    def test_new_activity_after_handles_are_pinned_prevents_termination(self):
+        target, identity = self.start_fixture(mode="ignore")
+        terminator = WindowsProcessTerminator()
+        guard = Mock(side_effect=RuntimeError("active_fixture"))
+        with self.assertRaisesRegex(RuntimeError, "active_fixture"):
+            terminator.terminate([identity], guard)
+        guard.assert_called_once_with()
+        self.assertFalse(terminator.terminated)
+        self.assertIsNone(target.poll())
 
 
 if __name__ == "__main__":

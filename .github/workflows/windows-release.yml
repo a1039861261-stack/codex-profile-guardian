@@ -67,6 +67,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Isolated browser install failed' }
           .\.venv\Scripts\python.exe tools/verify-history-conflict-ui.py
           if ($LASTEXITCODE -ne 0) { throw 'Conflict diagnostic UI acceptance failed' }
+          .\.venv\Scripts\python.exe tools/verify-codex-close-ui.py
+          if ($LASTEXITCODE -ne 0) { throw 'Codex close UI acceptance failed' }
       - name: Retain only the four public release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

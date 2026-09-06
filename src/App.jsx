@@ -798,7 +798,7 @@ function Protection({
               <div className="conflict-summary"><span>{interruptedTurnCount} 个已中断任务标记</span></div>
             </>
           ) : conflicts ? (
-            <><h2>未发现正文冲突，当前没有进行中任务</h2><p>账号切换仍会在执行瞬间再次复核；Guardian 不会强制结束 Codex。</p></>
+            <><h2>未发现正文冲突，当前没有进行中任务</h2><p>账号切换会再次复核任务状态；正常关闭超时后，将自动结束已确认归属的 Codex 后台进程。</p></>
           ) : (
             <><h2>尚未执行切换前检查</h2><p>点击刷新，核对进行中任务和同 ID 聊天分支。</p></>
           )}
@@ -978,7 +978,7 @@ function Settings({ status, onSave, onOpen, onRemoteSync, onUpdateCheck, onUpdat
     <div className="page-stack settings-layout">
       <section className="content-panel settings-panel">
         <header className="settings-heading"><span className="section-accent" /><div><h2>切换策略</h2><p>控制 Codex 关闭与重启行为</p></div></header>
-        <Toggle checked={settings.auto_close_codex ?? true} onChange={(value) => setSetting("auto_close_codex", value)} label="切换前自动关闭 Codex" detail="自动请求正常退出并等待最多 30 秒；不会强制结束进程" />
+        <Toggle checked={settings.auto_close_codex ?? true} onChange={(value) => setSetting("auto_close_codex", value)} label="切换前自动关闭 Codex" detail="先正常退出，最多等待 30 秒；超时后复核任务并自动结束 Codex 后台进程" />
         <Toggle checked={settings.auto_launch_codex ?? true} onChange={(value) => setSetting("auto_launch_codex", value)} label="切换成功后自动启动 Codex" detail="优先使用 Microsoft Store 系统入口" />
       </section>
       <section className="content-panel settings-panel update-panel">
@@ -1214,7 +1214,7 @@ function ConfirmModal({ action, status, onClose, onConfirm, busy }) {
   return (
     <Modal
       title={isUpdateInstall ? "安装已经校验的新版本？" : isRestore ? "恢复这个备份？" : isDelete ? "删除这个账号？" : isSync ? `更新 ${profile?.name} 的登录？` : isRemoteSync ? `同步 ${profile?.name} 到 SSH？` : `切换到 ${profile?.name}？`}
-      description={isUpdateInstall ? "将启动版本化安装包；安装器会排空后台网关，并在升级失败时恢复旧版本" : isRestore ? "恢复会回到该时间点的配置与会话索引" : isDelete ? "只删除 Guardian 保存的加密凭据" : isSync ? "将自动关闭 Codex，并读取刚刚重新登录后的最新凭据" : isRemoteSync ? `将写入 ${action?.hostCount || 0} 台已登记 SSH 主机，并让远端 Codex 重新加载配置` : "已完成只读预检；将自动正常关闭 Codex，最多等待 30 秒，不会强制结束进程"}
+      description={isUpdateInstall ? "将启动版本化安装包；安装器会排空后台网关，并在升级失败时恢复旧版本" : isRestore ? "恢复会回到该时间点的配置与会话索引" : isDelete ? "只删除 Guardian 保存的加密凭据" : isSync ? "将自动关闭 Codex，并读取刚刚重新登录后的最新凭据" : isRemoteSync ? `将写入 ${action?.hostCount || 0} 台已登记 SSH 主机，并让远端 Codex 重新加载配置` : "先正常关闭 Codex，最多等待 30 秒；仍未退出时，复核无进行中任务后自动强制退出"}
       onClose={onClose}
       size="small"
     >
@@ -1281,7 +1281,7 @@ function HistoryConflictConfirmModal({ report, onClose, onConfirm, busy }) {
     >
       <div className="conflict-confirm-warning">
         <Warning weight="fill" />
-        <div><strong>不要手动删除聊天</strong><p>操作会再次核对任务并正常关闭 Codex；所有原始副本会先进入完整冷备，未选分支只移入可恢复隔离库。</p></div>
+        <div><strong>不要手动删除聊天</strong><p>操作会再次核对任务并自动退出 Codex（正常关闭超时后会强制退出）；所有原始副本会先进入完整冷备，未选分支只移入可恢复隔离库。</p></div>
       </div>
       {manualConflicts.length ? (
         <div className="conflict-selection-list">

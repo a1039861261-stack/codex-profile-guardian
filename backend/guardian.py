@@ -27,6 +27,7 @@ from .claude_desktop import ClaudeDesktopError, ClaudeDesktopIntegration
 from .codex_lifecycle import (
     close_codex_gracefully,
     desktop_process_filter,
+    desktop_owned_processes,
     query_codex_processes,
     related_processes,
 )
@@ -2363,6 +2364,11 @@ class GuardianService:
         known = {p.identity for p in getattr(self, "_observed_codex_processes", ())}
         known.update(p.identity for p in related_processes(snapshot))
         self._observed_codex_processes = tuple(p for p in snapshot if p.identity in known)
+        owned = {p.identity for p in getattr(self, "_force_owned_codex_processes", ())}
+        owned.update(p.identity for p in desktop_owned_processes(snapshot))
+        self._force_owned_codex_processes = tuple(
+            p for p in snapshot if p.identity in owned and p.force_eligible
+        )
         return bool(self._observed_codex_processes)
 
     def _codex_turn_writer_state(self) -> str:
@@ -2387,11 +2393,20 @@ class GuardianService:
             self._last_codex_close_report = {"ok": False, "reason": "process_query_failed"}
             self._log("codex.close", "warning", "无法确认 Codex 进程状态，未发送关闭请求。", **self._last_codex_close_report)
             return False
-        report = close_codex_gracefully(timeout_seconds, observed=getattr(self, "_observed_codex_processes", ()))
+        report = close_codex_gracefully(
+            timeout_seconds,
+            observed=getattr(self, "_observed_codex_processes", ()),
+            force_after_timeout=True,
+            before_force=self._ensure_no_active_turns,
+            force_owned=getattr(self, "_force_owned_codex_processes", ()),
+        )
         self._last_codex_close_report = report
         self._log(
             "codex.close", "success" if report["ok"] else "warning",
-            "Codex 已正常退出。" if report["ok"] else self._codex_close_failure_message(report),
+            (
+                "Codex 已退出（正常关闭超时后已结束确认归属的后台进程）。"
+                if report.get("forced_count") else "Codex 已正常退出。"
+            ) if report["ok"] else self._codex_close_failure_message(report),
             **report,
         )
         return bool(report["ok"])
@@ -2404,9 +2419,15 @@ class GuardianService:
             "desktop_restarted": "等待退出时检测到新启动的 Codex，已停止切换，请确认任务状态后重试。",
             "no_close_window": "Codex 后台仍在运行，但没有可正常关闭的窗口；请从 Codex 菜单退出后重试。",
             "window_disabled": "Codex 有待处理的弹窗，请先处理弹窗后重试。",
+            "force_guard_missing": "无法复核 Codex 任务状态，已停止自动退出，请重试。",
+            "force_ownership_uncertain": "Codex 后台仍在运行，但无法确认全部进程属于桌面端，已停止自动退出；请退出 Codex 或独立 CLI 后重试。",
+            "force_termination_failed": "Windows 未能结束已确认归属的 Codex 进程，请检查两个程序的运行权限后重试。",
+            "force_exit_timeout": "已请求结束 Codex 后台进程，但仍检测到残留或新进程；请退出 Codex 后重试。",
             "window_close_failed": "Windows 未能发送正常关闭请求，请检查 Codex 弹窗及两个程序的运行权限后重试。",
         }
         prefix = messages.get(reason, f"已请求正常退出，但 Codex 在 {report.get('wait_seconds', 30):g} 秒内仍未完全退出，请检查 Codex 后重试。")
+        if report.get("force_attempted"):
+            return prefix + " Guardian 已尝试结束后台进程，未开始修改账号或聊天文件。"
         return prefix + " Guardian 未强制结束进程，也未开始修改账号或聊天文件。"
 
     @staticmethod

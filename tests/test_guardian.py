@@ -2457,13 +2457,16 @@ for line in sys.stdin:
         self.service._update_config = original_method  # type: ignore[method-assign]
         self.assertEqual((self.codex / "config.toml").read_bytes(), original_config)
 
-    def test_auto_close_never_falls_back_to_force_for_remaining_process_tree(self) -> None:
+    def test_auto_close_passes_mandatory_guard_and_owned_identities_to_fallback(self) -> None:
         self.service.is_fixture = False
         self.service._codex_related_process_state = Mock(return_value=True)  # type: ignore[method-assign]
         report = {"ok": False, "reason": "exit_timeout", "wait_seconds": 30, "remaining_count": 1}
         with patch("backend.guardian.close_codex_gracefully", return_value=report) as close, patch("backend.guardian.subprocess.run") as run:
             self.assertFalse(self.service.request_close_codex())
-        close.assert_called_once_with(30, observed=())
+        close.assert_called_once_with(
+            30, observed=(), force_after_timeout=True,
+            before_force=self.service._ensure_no_active_turns, force_owned=(),
+        )
         run.assert_not_called()
         logged = json.loads(self.service.logs_path.read_text(encoding="utf-8").splitlines()[-1])
         self.assertEqual(logged["action"], "codex.close")
@@ -2587,6 +2590,46 @@ for line in sys.stdin:
         command = Path(service.helper_command[0])
         self.assertEqual(command.parent, (self.data / "bin").resolve())
         self.assertNotIn("zip-temp", str(command))
+
+
+    def test_force_task_recheck_blocks_before_backup_and_account_writes(self) -> None:
+        profile = self.service.create_api_profile("force fixture", "https://api.example.invalid/v1", "fixture-key", "gpt-5")
+        before = {path: path.read_bytes() for path in self.codex.rglob("*") if path.is_file()}
+        self.service.is_fixture = False
+        self.service._codex_related_process_state = Mock(return_value=True)
+        self.service._ensure_no_active_turns = Mock(side_effect=[
+            None, GuardianPublicError("codex_active_turn", "fixture task started"),
+        ])
+        def recheck(*args, **kwargs):
+            kwargs["before_force"]()
+        with patch("backend.guardian.close_codex_gracefully", side_effect=recheck), patch.object(self.service, "create_backup") as backup:
+            with self.assertRaises(GuardianPublicError) as raised:
+                self.service.switch_profile(profile["id"])
+        self.assertEqual(raised.exception.code, "codex_active_turn")
+        backup.assert_not_called()
+        self.assertEqual(before, {path: path.read_bytes() for path in self.codex.rglob("*") if path.is_file()})
+
+    def test_force_ownership_is_remembered_only_for_the_same_process_instance(self) -> None:
+        from backend.codex_lifecycle import CodexProcess
+        desktop = CodexProcess(100, 1, 1000, "desktop", True)
+        child = CodexProcess(101, 100, 1001, "runtime_server", True)
+        reused = CodexProcess(101, 1, 9000, "runtime_server", True)
+        with patch("backend.guardian.os.name", "nt"), patch(
+            "backend.guardian.query_codex_processes", side_effect=[[desktop, child], [child], [reused]],
+        ):
+            self.assertTrue(self.service._codex_related_process_state())
+            self.assertTrue(self.service._codex_related_process_state())
+            self.assertEqual(self.service._force_owned_codex_processes, (child,))
+            self.assertFalse(self.service._codex_related_process_state())
+            self.assertEqual(self.service._force_owned_codex_processes, ())
+
+    def test_force_failure_message_does_not_claim_no_termination_was_attempted(self) -> None:
+        message = self.service._codex_close_failure_message({
+            "reason": "force_exit_timeout", "force_attempted": True, "forced_count": 1,
+        })
+        self.assertIn("已尝试结束后台进程", message)
+        self.assertIn("未开始修改账号或聊天文件", message)
+        self.assertNotIn("未强制结束进程", message)
 
 
 if __name__ == "__main__":

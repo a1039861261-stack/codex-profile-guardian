@@ -137,10 +137,10 @@ class CodexLifecycleTests(unittest.TestCase):
         self.assertEqual(result["win32_error"], 5)
         self.assertNotIn("sensitive", json.dumps(result))
 
-    def test_native_backend_has_no_forced_termination_or_task_tree_command(self):
+    def test_native_backend_never_uses_unscoped_or_recursive_kill_commands(self):
         from pathlib import Path
         source = (Path(__file__).resolve().parents[1] / "backend" / "codex_lifecycle.py").read_text(encoding="utf-8")
-        for forbidden in ("taskkill", "TerminateProcess(", "Stop-Process", "GenerateConsoleCtrlEvent", ".kill("):
+        for forbidden in ("taskkill", "Stop-Process", "GenerateConsoleCtrlEvent", ".kill("):
             self.assertNotIn(forbidden, source)
         self.assertIn("PostMessageW(hwnd, 0x0010, 0, 0)", source)
 

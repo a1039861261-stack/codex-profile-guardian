@@ -35,7 +35,11 @@ def verify(browser, width: int, height: int) -> dict:
         before = fixture.protected_hashes()
         server = start_server(fixture.service, ROOT / "dist", "127.0.0.1", 0)
         origin = f"http://127.0.0.1:{server.server_address[1]}"
-        context = browser.new_context(viewport={"width": width, "height": height})
+        # Compact navigation is outside this fix; enter the page at desktop width.
+        context = browser.new_context(viewport={
+            "width": 1440 if width < 680 else width,
+            "height": 960 if width < 680 else height,
+        })
         external = []
 
         def local_only(route):
@@ -65,7 +69,10 @@ def verify(browser, width: int, height: int) -> dict:
             return_value={"state": "up_to_date", "current_version": "1.10.5", "latest_version": "1.10.5"},
         ):
             page.goto(origin, wait_until="networkidle")
-            page.locator(".sidebar nav button").filter(has_text="聊天保护").click()
+            page.get_by_role("button", name="聊天保护", exact=True).click()
+            expect(page.get_by_role("button", name="选择保留副本", exact=True)).to_be_enabled()
+            if width < 680:
+                page.set_viewport_size({"width": width, "height": height})
             page.get_by_role("button", name="选择保留副本", exact=True).click()
             # Choose explicitly, matching the stale-database-path customer flow.
             page.locator('input[type="radio"]').first.check()
@@ -131,7 +138,7 @@ def verify(browser, width: int, height: int) -> dict:
             "code": failure["code"], "cold_backup_complete": True,
             "history_unchanged": True, "error_visible_in_toast_and_log": True,
             "javascript_errors": len(errors), "unexpected_console_issues": len(console_issues),
-            "horizontal_overflow": False, "log_navigation_uses_desktop": width < 680,
+            "horizontal_overflow": False, "navigation_uses_desktop": width < 680,
         }
     finally:
         if context:
@@ -145,7 +152,11 @@ def verify(browser, width: int, height: int) -> dict:
 with sync_playwright() as playwright:
     browser = playwright.chromium.launch(headless=True)
     try:
-        results = [verify(browser, 1440, 960), verify(browser, 390, 844)]
+        results = []
+        for width, height in ((1440, 960), (390, 844)):
+            result = verify(browser, width, height)
+            results.append(result)
+            print(json.dumps({"completed_viewport": result}, ensure_ascii=False), flush=True)
     finally:
         browser.close()
 print(json.dumps({"history_conflict_ui": results, "private_data_used": False}, ensure_ascii=False))

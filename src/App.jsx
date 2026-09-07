@@ -488,11 +488,11 @@ function claudeStateCopy(status) {
   const provider = status?.current_profile;
   if (status?.state === "ready") {
     return {
-      tone: "success",
-      eyebrow: "连接正常",
+      tone: "warning",
+      eyebrow: "配置已启用 · 接口待验证",
       title: "Claude API 由 Guardian 独立管理",
-      detail: "Claude Desktop 正在直连 Guardian 保存的 Anthropic 兼容供应商，不依赖 CC Switch 运行。",
-      action: "无需处理",
+      detail: "供应商配置已写入。Guardian 尚未验证模型列表、密钥和对话接口；请在 Claude Desktop 中确认可用。",
+      action: status?.gateway?.online === false ? "启动本地供应商服务" : "在 Claude 中确认模型与对话",
     };
   }
   if (status?.state === "external") {
@@ -612,7 +612,7 @@ function ClaudeDesktopPage({ status, loading, busy, onRefresh, onAdd, onEdit, on
                   <div><strong>{item.name}</strong><code>{item.base_url}</code><span>{item.models?.length || 0} 个模型 · Key ••••{item.secret_hint || ""}</span></div>
                 </div>
                 <div className="claude-provider-actions">
-                  {item.current ? <Badge tone="blue">当前</Badge> : <Button tone="primary" onClick={() => onApply(item)} disabled={busy}>启用</Button>}
+                  {item.current ? <><Badge tone="blue">当前</Badge><Button onClick={() => onApply(item)} disabled={busy}>重新应用</Button></> : <Button tone="primary" onClick={() => onApply(item)} disabled={busy}>启用</Button>}
                   <Button icon={PencilSimple} onClick={() => onEdit(item)} disabled={busy}>编辑</Button>
                   <Button icon={Trash} onClick={() => onDelete(item)} disabled={busy || item.current}>删除</Button>
                 </div>
@@ -647,7 +647,7 @@ function ClaudeDesktopPage({ status, loading, busy, onRefresh, onAdd, onEdit, on
           </div>
         ) : (
           <div className="claude-routes-empty">
-            <span>未手动指定模型时，Claude Desktop 会读取供应商的模型列表。</span>
+            <span>未手动指定模型。Claude Desktop 需要从供应商读取模型列表；若列表为空，请检查接口地址与密钥。</span>
           </div>
         )}
       </section>
@@ -701,7 +701,7 @@ function ClaudeProviderModal({ profile, onClose, onSaved, notify }) {
     <Modal title={editing ? `编辑 ${profile.name}` : "添加 Claude 供应商"} description="仅支持原生 Anthropic Messages API；Guardian 不依赖 CC Switch 本地路由。" onClose={onClose}>
       <form className="modal-form" onSubmit={submit}>
         <label><span>供应商名称</span><input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} /></label>
-        <label><span>Anthropic 接口地址</span><input required value={form.base_url} onChange={(event) => setForm({ ...form, base_url: event.target.value })} placeholder="https://api.example.com" /></label>
+        <label><span>Anthropic 接口地址</span><input required value={form.base_url} onChange={(event) => setForm({ ...form, base_url: event.target.value })} placeholder="https://api.example.com" /><small className="form-help">填写服务根地址；Claude 会自动追加 /v1/models 和 /v1/messages，末尾的 /v1 会自动去除。</small></label>
         <label><span>API Key{editing ? "（留空不修改）" : ""}</span><input type="password" required={!editing} autoComplete="off" value={form.api_key} onChange={(event) => setForm({ ...form, api_key: event.target.value })} /></label>
         <label><span>模型 ID（可选，每行一个）</span><textarea rows="4" value={form.models} onChange={(event) => setForm({ ...form, models: event.target.value })} placeholder={"claude-sonnet-5\nclaude-opus-4-8"} /><small className="form-help">只能填写供应商真实接受的 claude-* 模型；这里不做协议转换或虚假映射。</small></label>
         <div className="info-callout"><LockKey weight="duotone" /><div><strong>凭据边界</strong><p>Guardian 自己的副本由 Windows DPAPI 加密；启用时 Claude Desktop 3P profile 按客户端要求包含运行凭据，日志和界面永不显示完整 Key。</p></div></div>
@@ -1229,10 +1229,14 @@ function ConfirmModal({ action, status, onClose, onConfirm, busy }) {
   const isRemoteSync = action?.type === "remote-sync";
   const isUpdateInstall = action?.type === "update-install";
   const isSwitch = action?.type === "switch";
+  const switchBlocked = isSwitch && action?.preflight?.safe_to_switch !== true;
+  const switchBlockMessage = action?.preflight?.lineage?.ready === false
+    ? action.preflight.lineage.message || "聊天历史依赖异常，请先查看聊天保护页。"
+    : "只读预检尚未通过，请关闭弹窗并刷新聊天保护页后重试。";
   return (
     <Modal
       title={isUpdateInstall ? "安装已经校验的新版本？" : isRestore ? "恢复这个备份？" : isDelete ? "删除这个账号？" : isSync ? `更新 ${profile?.name} 的登录？` : isRemoteSync ? `同步 ${profile?.name} 到 SSH？` : `切换到 ${profile?.name}？`}
-      description={isUpdateInstall ? "将启动版本化安装包；安装器会排空后台网关，并在升级失败时恢复旧版本" : isRestore ? "恢复会回到该时间点的配置与会话索引" : isDelete ? "只删除 Guardian 保存的加密凭据" : isSync ? "将自动关闭 Codex，并读取刚刚重新登录后的最新凭据" : isRemoteSync ? `将写入 ${action?.hostCount || 0} 台已登记 SSH 主机，并让远端 Codex 重新加载配置` : "已完成只读预检；将直接强制结束 Codex 后台进程，确认退出后切换账号"}
+      description={isUpdateInstall ? "将启动版本化安装包；安装器会排空后台网关，并在升级失败时恢复旧版本" : isRestore ? "恢复会回到该时间点的配置与会话索引" : isDelete ? "只删除 Guardian 保存的加密凭据" : isSync ? "将自动关闭 Codex，并读取刚刚重新登录后的最新凭据" : isRemoteSync ? `将写入 ${action?.hostCount || 0} 台已登记 SSH 主机，并让远端 Codex 重新加载配置` : switchBlocked ? switchBlockMessage : "已完成只读预检；将直接强制结束 Codex 后台进程，确认退出后切换账号"}
       onClose={onClose}
       size="small"
     >
@@ -1253,6 +1257,8 @@ function ConfirmModal({ action, status, onClose, onConfirm, busy }) {
           <><span><CheckCircle weight="fill" /> 只接受同一个官方账号的最新登录</span><span><CheckCircle weight="fill" /> 更新前自动创建安全备份</span><span><CheckCircle weight="fill" /> 不改变聊天记录与归档状态</span></>
         ) : isRemoteSync ? (
           <><span><CheckCircle weight="fill" /> 远端有活动任务时会拒绝同步</span><span><CheckCircle weight="fill" /> API Key 只通过 SSH 标准输入传输</span><span><CheckCircle weight="fill" /> 每台主机都会返回独立结果</span></>
+        ) : switchBlocked ? (
+          <span role="alert"><Warning weight="fill" /> {switchBlockMessage}</span>
         ) : (
           <>
             <span><CheckCircle weight="fill" /> 未检测到进行中任务或正文冲突</span>
@@ -1264,7 +1270,7 @@ function ConfirmModal({ action, status, onClose, onConfirm, busy }) {
       </div>
       <footer className="modal-footer">
         <Button onClick={onClose}>取消</Button>
-        <Button tone={isDelete ? "danger" : "primary"} icon={isDelete ? Trash : ArrowClockwise} loading={busy} onClick={onConfirm} disabled={busy || (isSwitch && !action?.preflight?.safe_to_switch)}>
+        <Button tone={isDelete ? "danger" : "primary"} icon={isDelete ? Trash : ArrowClockwise} loading={busy} onClick={onConfirm} disabled={busy || switchBlocked}>
           {isUpdateInstall ? "启动安装" : isRestore ? "确认恢复" : isDelete ? "确认删除" : isSync ? "更新登录" : isRemoteSync ? "同步到 SSH" : "安全切换"}
         </Button>
       </footer>
@@ -1641,6 +1647,13 @@ export function App() {
       notify(`检测到 ${conflictCount} 组同 ID 聊天正文分叉；反复切换不会恢复，请先完成全量冷备与隔离。`, "warning");
       return;
     }
+    if (report.safe_to_switch !== true) {
+      setRoute("protection");
+      notify(report.lineage?.ready === false
+        ? report.lineage.message || "聊天历史依赖异常，已停止切换。请在聊天保护页查看原因。"
+        : "只读预检尚未通过，已停止切换。请刷新聊天保护页后重试。", "warning");
+      return;
+    }
     setConfirmAction({ type: "switch", profile, preflight: report });
   }, [run, refreshConflicts, notify]);
 
@@ -1753,7 +1766,7 @@ export function App() {
           )}
         </nav>
         <div className="sidebar-status">
-          <span className={`status-dot ${activePlatform === "claude" ? (claudeStatus?.state === "ready" || claudeStatus?.state === "official" ? "is-live" : "") : status?.codex_running ? "is-live" : ""}`} />
+          <span className={`status-dot ${activePlatform === "claude" ? (claudeStatus?.state === "official" ? "is-live" : "") : status?.codex_running ? "is-live" : ""}`} />
           {activePlatform === "claude" ? (
             <div><strong>{claudeState.title}</strong><span>{claudeStatus?.current_profile?.name || "Claude Desktop"}</span></div>
           ) : (
@@ -1773,7 +1786,7 @@ export function App() {
               <div><span className="breadcrumb">CODEX PROFILE GUARDIAN</span><h1>{title}</h1><p>{subtitle}</p></div>
               <div className="topbar-actions">
                 {route === "claude" ? (
-                  <div className={`connection-pill ${claudeStatus?.state === "ready" || claudeStatus?.state === "official" ? "is-safe" : "is-warning"}`}><span /><div><strong>{claudeState.eyebrow}</strong><small>{claudeStatus?.current_profile?.name || "Claude Desktop"}</small></div></div>
+                  <div className={`connection-pill ${claudeStatus?.state === "official" ? "is-safe" : "is-warning"}`}><span /><div><strong>{claudeState.eyebrow}</strong><small>{claudeStatus?.current_profile?.name || "Claude Desktop"}</small></div></div>
                 ) : (
                   <div className={`connection-pill ${status?.health?.safe ? "is-safe" : "is-warning"}`}><span /><div><strong>{status?.health?.safe ? "会话库正常" : "需要检查"}</strong><small>{status?.config_provider}</small></div></div>
                 )}

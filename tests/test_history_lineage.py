@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import unittest
@@ -249,4 +250,67 @@ class PaginatedHistoryTests(unittest.TestCase):
         self.assertIn("invalid_history_base", report["lineage"]["issue_counts"])
         self.assertNotIn("PRIVATE-invalid-source", json.dumps(report["lineage"]))
         self.assertFalse(report["can_isolate"])
+        self.assertEqual(self.hashes(), before)
+
+
+    def set_current_reference(self, path):
+        with sqlite3.connect(self.codex / "state_5.sqlite") as db:
+            db.execute("UPDATE threads SET rollout_path=? WHERE id=?", (str(path), self.active_id))
+        db.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows extended path regression")
+    def test_extended_windows_current_path_switch_preserves_raw_reference_and_history(self):
+        extended = Path("\\\\?\\" + str(self.current))
+        self.assertTrue(extended.samefile(self.current))
+        self.set_current_reference(extended)
+        before = self.hashes()
+        report = self.service.history_conflict_report()
+        self.assertTrue(report["safe_to_switch"], report["lineage"])
+        self.assertEqual(self.hashes(), before)
+        self.test_switch_to_api_then_official_preserves_lineage_bytes_and_sidebar()
+        self.assertEqual(next(row[2] for row in self.rows() if row[0] == self.active_id), str(extended))
+
+    @unittest.skipUnless(os.name == "nt", "Windows extended path regression")
+    def test_extended_windows_original_rollout_is_not_a_missing_current_file(self):
+        self.set_current_reference(Path("\\\\?\\" + str(self.original)))
+        before = self.hashes()
+        self.assertTrue(self.service.history_conflict_report()["safe_to_switch"])
+        self.assertEqual(self.hashes(), before)
+
+    @unittest.skipUnless(os.name == "nt", "Windows extended path regression")
+    def test_extended_missing_current_still_refuses_older_same_thread_rollout(self):
+        self.set_current_reference(Path("\\\\?\\" + str(self.current)))
+        self.test_missing_current_path_does_not_fall_back_to_old_same_thread_file()
+
+    @unittest.skipUnless(os.name == "nt", "Windows extended path regression")
+    def test_extended_current_archive_mismatch_still_blocks(self):
+        self.set_current_reference(Path("\\\\?\\" + str(self.current)))
+        with sqlite3.connect(self.codex / "state_5.sqlite") as db:
+            db.execute("UPDATE threads SET archived=1 WHERE id=?", (self.active_id,))
+        db.close()
+        before = self.hashes()
+        report = self.service.history_conflict_report()
+        self.assertFalse(report["safe_to_switch"])
+        self.assertEqual(report["lineage"]["issue_counts"]["current_archive_mismatch"], 1)
+        self.assertEqual(self.hashes(), before)
+
+    @unittest.skipUnless(os.name == "nt", "Windows extended path regression")
+    def test_different_file_with_identical_bytes_is_not_a_path_alias(self):
+        outside = self.data / self.current.name
+        outside.write_bytes(self.current.read_bytes())
+        self.set_current_reference(Path("\\\\?\\" + str(outside)))
+        before = self.hashes()
+        report = self.service.history_conflict_report()
+        self.assertFalse(report["safe_to_switch"])
+        self.assertEqual(report["lineage"]["issue_counts"]["missing_current_rollout"], 1)
+        self.assertEqual(self.hashes(), before)
+
+    @unittest.skipUnless(os.name == "nt", "Windows extended path regression")
+    def test_unverifiable_path_alias_keeps_switch_blocked(self):
+        self.set_current_reference(Path("\\\\?\\" + str(self.current)))
+        before = self.hashes()
+        with patch.object(Path, "samefile", side_effect=PermissionError("fixture denied")):
+            report = self.service.history_conflict_report()
+        self.assertFalse(report["safe_to_switch"])
+        self.assertEqual(report["lineage"]["issue_counts"]["missing_current_rollout"], 1)
         self.assertEqual(self.hashes(), before)

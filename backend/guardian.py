@@ -46,7 +46,7 @@ from .remote_gateway_status import (
 )
 from .remote_sync import discover_remote_hosts, sync_api_profile_to_remotes, sync_official_to_remotes
 from .updater import GitHubReleaseUpdater, UpdateError
-from .history_lineage import inspect_lineage, BLOCKED_MESSAGE as HISTORY_LINEAGE_BLOCKED
+from .history_lineage import inspect_lineage, resolve_rollout_path, BLOCKED_MESSAGE as HISTORY_LINEAGE_BLOCKED
 from .failover import (
     AtomicFailoverDocumentStore,
     FailoverManagementService,
@@ -3340,10 +3340,10 @@ class GuardianService:
     ) -> dict[str, Any]:
         by_id: dict[str, list[dict[str, Any]]] = {}
         entries: list[dict[str, Any]] = []
-        active_root = (self.codex_home / "sessions").resolve()
-        archived_root = (self.codex_home / "archived_sessions").resolve()
+        active_root = resolve_rollout_path(self.codex_home / "sessions")
+        archived_root = resolve_rollout_path(self.codex_home / "archived_sessions")
         for path in self._rollout_files():
-            resolved = path.resolve()
+            resolved = resolve_rollout_path(path)
             try:
                 with resolved.open("rb") as source:
                     first_line = source.readline()
@@ -3466,7 +3466,7 @@ class GuardianService:
                 if not candidate.is_absolute():
                     candidate = self.codex_home / candidate
                 try:
-                    resolved_path = candidate.resolve()
+                    resolved_path = resolve_rollout_path(candidate)
                 except OSError:
                     resolved_path = None
             references[str(thread_id_raw)] = {
@@ -4229,7 +4229,7 @@ class GuardianService:
         missing_archived = 0
         unsafe_missing_references = 0
         managed_roots = tuple(
-            (self.codex_home / directory).resolve()
+            resolve_rollout_path(self.codex_home / directory)
             for directory in ("sessions", "archived_sessions")
         )
         # Manual cleanup can legitimately leave a SQLite row after its rollout
@@ -4249,7 +4249,7 @@ class GuardianService:
             if not candidate.is_absolute():
                 candidate = self.codex_home / candidate
             try:
-                resolved_candidate = candidate.resolve()
+                resolved_candidate = resolve_rollout_path(candidate)
                 candidate_is_managed = any(
                     resolved_candidate.is_relative_to(root) for root in managed_roots
                 )
@@ -4281,7 +4281,7 @@ class GuardianService:
             if not candidate.is_absolute():
                 candidate = self.codex_home / candidate
             try:
-                candidate = candidate.resolve()
+                candidate = resolve_rollout_path(candidate)
             except OSError:
                 stale_paths += 1
                 continue

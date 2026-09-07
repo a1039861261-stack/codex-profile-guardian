@@ -211,7 +211,9 @@ class ClaudeDesktopIntegration:
             raise ClaudeDesktopError("claude_provider_https_required")
         if port is not None and not 1 <= port <= 65535:
             raise ClaudeDesktopError("claude_provider_base_url_invalid")
-        return raw
+        # Claude Desktop appends /v1/models and /v1/messages itself.
+        # Preserve gateway path prefixes, but accept the common API-root input.
+        return raw[:-3] if parsed.path.endswith("/v1") else raw
 
     @staticmethod
     def _normalize_models(value: Any) -> list[dict[str, Any]]:
@@ -507,6 +509,8 @@ class ClaudeDesktopIntegration:
             )
             if profile is None:
                 raise ClaudeDesktopError("claude_provider_not_found")
+            # Normalize profiles saved by older releases only on explicit apply.
+            profile["base_url"] = self._normalize_base_url(profile["base_url"])
             api_key = self._read_secret(profile)
             snapshot = self._snapshot()
             backup_name = self._persist_snapshot(snapshot, "apply")
@@ -742,6 +746,8 @@ class ClaudeDesktopIntegration:
             "migration": migration,
             "updated_at": updated_at,
             "restart_required_after_change": True,
+            "connection_verified": False,
+            "model_discovery_verified": False,
         }
 
     def _claude_update_executable(self) -> Path | None:

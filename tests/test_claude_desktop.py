@@ -90,7 +90,7 @@ class ClaudeDesktopIntegrationTests(unittest.TestCase):
         self.assertEqual(normal, {"deploymentMode": "3p", "keep": True})
         self.assertEqual(threep["deploymentMode"], "3p")
         self.assertEqual(threep["preferences"], {"keep": True})
-        self.assertEqual(deployed["inferenceGatewayBaseUrl"], "https://anthropic.example.test/v1")
+        self.assertEqual(deployed["inferenceGatewayBaseUrl"], "https://anthropic.example.test")
         self.assertEqual(deployed["inferenceGatewayApiKey"], SECRET_CANARY)
         self.assertEqual(deployed["inferenceGatewayAuthScheme"], "bearer")
         self.assertEqual(deployed["inferenceProvider"], "gateway")
@@ -105,6 +105,58 @@ class ClaudeDesktopIntegrationTests(unittest.TestCase):
         self.assertEqual(status["config_owner"], "guardian")
         self.assertEqual(status["credential_state"], "managed_by_guardian")
         self.assertEqual(status["current_profile"]["id"], profile["id"])
+
+
+    def test_api_root_input_produces_one_version_segment_for_desktop_discovery(self) -> None:
+        for supplied, expected in (
+            ("https://anthropic.example.test/v1/", "https://anthropic.example.test"),
+            ("https://anthropic.example.test/anthropic/v1", "https://anthropic.example.test/anthropic"),
+            ("https://anthropic.example.test/v10", "https://anthropic.example.test/v10"),
+            ("https://anthropic.example.test/proxy", "https://anthropic.example.test/proxy"),
+        ):
+            with self.subTest(supplied=supplied):
+                profile = self.integration.create_profile("Fixture", supplied, SECRET_CANARY)
+                self.integration.apply_profile(profile["id"], confirmed=True)
+                deployed = json.loads(self.integration.profile_path.read_text(encoding="utf-8"))
+                self.assertEqual(deployed["inferenceGatewayBaseUrl"] + "/v1/models", expected + "/v1/models")
+                status = self.integration.status()
+                self.assertFalse(status["connection_verified"])
+                self.assertFalse(status["model_discovery_verified"])
+                self.assertIsNone(status["gateway"]["online"])
+                self.assertEqual(status["models"], [])
+
+    def test_existing_api_root_profile_is_only_normalized_on_explicit_reapply(self) -> None:
+        profile = self._create_profile()
+        store = self.integration._load_store()
+        store["profiles"][0]["base_url"] = "https://anthropic.example.test/v1"
+        self.integration._save_store(store)
+        before = self.integration.store_path.read_bytes()
+        self.integration.status()
+        self.assertEqual(self.integration.store_path.read_bytes(), before)
+        with self.assertRaises(ClaudeDesktopError):
+            self.integration.apply_profile(profile["id"], confirmed=False)
+        self.assertEqual(self.integration.store_path.read_bytes(), before)
+        self.integration.apply_profile(profile["id"], confirmed=True)
+        deployed = json.loads(self.integration.profile_path.read_text(encoding="utf-8"))
+        self.assertEqual(deployed["inferenceGatewayBaseUrl"], "https://anthropic.example.test")
+        self.assertEqual(self.integration.status()["current_profile"]["base_url"], "https://anthropic.example.test")
+        self.assertEqual(len(list(self.integration.backups_dir.glob("*.dpapi"))), 1)
+
+    def test_claude_apply_does_not_touch_codex_configuration_or_history(self) -> None:
+        codex = self.root / ".codex"
+        codex.mkdir()
+        sentinels = {
+            codex / "config.toml": b'model_provider = "openai"\n',
+            codex / "auth.json": b'{"fixture":"unchanged"}\n',
+            codex / "state_5.sqlite": b"fixture database sentinel",
+            codex / "session_index.jsonl": b'{"fixture":"index"}\n',
+        }
+        for path, data in sentinels.items():
+            path.write_bytes(data)
+        profile = self._create_profile()
+        self.integration.apply_profile(profile["id"], confirmed=True)
+        self.integration.restore_official(confirmed=True)
+        self.assertEqual({path: path.read_bytes() for path in sentinels}, sentinels)
 
     def test_apply_failure_restores_every_claude_file(self) -> None:
         self._write_json(self.integration.normal_config_path, {"deploymentMode": "1p"})

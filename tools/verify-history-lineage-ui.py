@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from playwright.sync_api import expect, sync_playwright
+from backend.guardian import APP_VERSION
 from backend.server import start_server
 from tests.test_history_lineage import PaginatedHistoryTests
 
@@ -23,6 +24,10 @@ def verify(browser, width, height):
     fixture.setUp()
     server = context = None
     try:
+        profile = fixture.service.create_api_profile(
+            "分页切换验证", "https://api.example.invalid/v1", "fixture-key", "gpt-test",
+        )
+        fixture.set_current_reference(Path("\\\\?\\" + str(fixture.current)))
         server = start_server(fixture.service, ROOT / "dist", "127.0.0.1", 0)
         origin = f"http://127.0.0.1:{server.server_address[1]}"
         context = browser.new_context(viewport={"width": 1440, "height": 960})
@@ -39,15 +44,26 @@ def verify(browser, width, height):
         page = context.new_page()
         page.set_default_timeout(30000)
         errors = []
+        switch_posts = []
+        page.on("request", lambda request: switch_posts.append(request.url)
+                if request.method == "POST" and request.url.endswith("/switch") else None)
         console = []
         page.on("pageerror", lambda error: errors.append(type(error).__name__))
         page.on("console", lambda message: console.append(message.type)
                 if message.type in ("warning", "error") else None)
         with patch.object(fixture.service, "update_status", return_value={
-            "state": "up_to_date", "current_version": "1.10.8", "latest_version": "1.10.8",
+            "state": "up_to_date", "current_version": APP_VERSION, "latest_version": APP_VERSION,
         }):
             before = fixture.hashes()
             page.goto(origin, wait_until="networkidle")
+            page.get_by_role("button", name="账号", exact=True).click()
+            page.set_viewport_size({"width": width, "height": height})
+            page.locator(".profile-card").filter(has_text=profile["name"]).get_by_role("button", name="安全切换", exact=True).click()
+            dialog = page.get_by_role("dialog", name="切换到 分页切换验证？", exact=True)
+            expect(dialog).to_be_visible()
+            expect(dialog.get_by_role("button", name="安全切换", exact=True)).to_be_enabled()
+            dialog.get_by_role("button", name="取消", exact=True).click()
+            page.set_viewport_size({"width": 1440, "height": 960})
             page.get_by_role("button", name="聊天保护", exact=True).click()
             page.set_viewport_size({"width": width, "height": height})
             expect(page.get_by_role("heading", name="分页历史依赖检查通过", exact=True)).to_be_visible()
@@ -58,8 +74,12 @@ def verify(browser, width, height):
             saved_source = fixture.original.read_bytes()
             fixture.original.unlink()
             missing_before = fixture.hashes()
-            page.get_by_role("button", name="刷新检测", exact=True).click()
+            page.set_viewport_size({"width": 1440, "height": 960})
+            page.get_by_role("button", name="账号", exact=True).click()
+            page.set_viewport_size({"width": width, "height": height})
+            page.locator(".profile-card").filter(has_text=profile["name"]).get_by_role("button", name="安全切换", exact=True).click()
             expect(page.get_by_role("heading", name="聊天历史依赖异常，已停止切换", exact=True)).to_be_visible()
+            expect(page.get_by_role("dialog")).to_have_count(0)
             expect(page.get_by_text("1 个源历史缺失", exact=True)).to_be_visible()
             expect(page.get_by_role("button", name="打开隔离库", exact=True)).to_be_enabled()
             response = context.request.post(
@@ -76,11 +96,24 @@ def verify(browser, width, height):
             page.get_by_role("button", name="刷新检测", exact=True).click()
             expect(page.get_by_role("heading", name="分页历史依赖检查通过", exact=True)).to_be_visible()
             assert fixture.hashes() == before
+            generic = fixture.service.history_conflict_report()
+            generic["safe_to_switch"] = False
+            with patch.object(fixture.service, "history_conflict_report", return_value=generic):
+                page.set_viewport_size({"width": 1440, "height": 960})
+                page.get_by_role("button", name="账号", exact=True).click()
+                page.set_viewport_size({"width": width, "height": height})
+                page.locator(".profile-card").filter(has_text=profile["name"]).get_by_role("button", name="安全切换", exact=True).click()
+                expect(page.locator(".toast")).to_contain_text("只读预检尚未通过")
+                expect(page.get_by_role("dialog")).to_have_count(0)
+            assert fixture.hashes() == before
+            assert not switch_posts
             assert not errors and not console and not external
             return {
                 "viewport": f"{width}x{height}", "immutable_rollouts_preserved": True,
                 "missing_source_visible": True, "blocked_http_status": response.status,
                 "original_source_restore_rechecked": True, "private_data_used": False,
+                "windows_path_alias_button_enabled": True, "account_preflight_block_reason_visible": True,
+                "generic_preflight_blocked": True, "switch_posts": len(switch_posts),
                 "javascript_errors": len(errors), "unexpected_console_issues": len(console),
                 "horizontal_overflow": False, "navigation_uses_desktop": width < 680,
             }

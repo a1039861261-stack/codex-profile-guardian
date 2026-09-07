@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+import os
 import re
 import uuid
 
@@ -19,6 +20,31 @@ BLOCKED_MESSAGE = (
     "聊天历史依赖尚未通过检查，已停止切换和冲突隔离。"
     "请保留完整冷备与隔离库，先核对缺失的源历史；切回账号不会自动恢复缺失文件。"
 )
+
+
+def resolve_rollout_path(path: Path) -> Path:
+    """Compare Windows extended DOS/UNC aliases only after verifying file identity.
+
+    Keep the original spelling when either path is missing or inaccessible.
+    This never substitutes another rollout belonging to the same thread and
+    never rewrites the authoritative SQLite value.
+    """
+    resolved = path.resolve()
+    value = str(resolved)
+    if os.name != "nt" or not value.startswith("\\\\?\\"):
+        return resolved
+    if value[:8].lower() == "\\\\?\\unc\\":
+        ordinary = Path("\\\\" + value[8:])
+    elif re.match(r"^[A-Za-z]:\\", value[4:]):
+        ordinary = Path(value[4:])
+    else:
+        return resolved
+    try:
+        if ordinary.samefile(resolved):
+            return ordinary
+    except OSError:
+        pass
+    return resolved
 
 
 def rollout_identity(path: Path):

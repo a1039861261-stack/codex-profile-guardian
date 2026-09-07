@@ -57,7 +57,7 @@ def verify(browser, width, height):
             "state": "up_to_date", "current_version": APP_VERSION, "latest_version": APP_VERSION,
         }):
             page.goto(origin, wait_until="networkidle")
-            page.get_by_role("button", name="Claude", exact=True).click()
+            page.get_by_role("tab", name="Claude", exact=True).click()
             page.set_viewport_size({"width": width, "height": height})
             page.get_by_role("button", name="添加供应商", exact=True).click()
             dialog = page.get_by_role("dialog", name="添加 Claude 供应商", exact=True)
@@ -85,6 +85,22 @@ def verify(browser, width, height):
             deployed = json.loads(fixture.service.claude_desktop.profile_path.read_text(encoding="utf-8"))
             assert deployed["inferenceGatewayBaseUrl"] + "/v1/models" == "https://anthropic.example.invalid/v1/models"
             assert len(list(fixture.service.claude_desktop.backups_dir.glob("*.dpapi"))) == 1
+            card.get_by_role("button", name="编辑", exact=True).click()
+            edit_dialog = page.get_by_role("dialog", name="编辑 Claude fixture", exact=True)
+            edit_dialog.locator("label").filter(has_text="Anthropic 接口地址").locator("input").fill("https://anthropic.example.invalid/gateway/v1")
+            edit_dialog.get_by_role("button", name="保存", exact=True).click()
+            expect(edit_dialog).to_have_count(0)
+            expect(page.locator(".toast")).to_contain_text("请重新应用并重启 Claude Desktop")
+            assert json.loads(fixture.service.claude_desktop.profile_path.read_text(encoding="utf-8")) == deployed
+            card.get_by_role("button", name="重新应用", exact=True).click()
+            page.get_by_role("dialog", name="启用 Claude fixture？", exact=True).get_by_role("button", name="确认启用", exact=True).click()
+            restart = page.get_by_role("dialog", name="重启 Claude Desktop？", exact=True)
+            expect(restart).to_be_visible()
+            restart.get_by_role("button", name="取消", exact=True).click()
+            reapplied = json.loads(fixture.service.claude_desktop.profile_path.read_text(encoding="utf-8"))
+            assert reapplied["inferenceGatewayBaseUrl"] == "https://anthropic.example.invalid/gateway"
+            assert reapplied["inferenceGatewayApiKey"] == deployed["inferenceGatewayApiKey"]
+            assert len(list(fixture.service.claude_desktop.backups_dir.glob("*.dpapi"))) == 2
             assert page.evaluate("document.documentElement.scrollWidth") <= width + 1
             screenshots = ROOT / "output" / "playwright"
             screenshots.mkdir(parents=True, exist_ok=True)
@@ -95,7 +111,7 @@ def verify(browser, width, height):
         assert not errors and not console and not external
         return {"viewport": f"{width}x{height}", "api_root_normalized": True,
                 "unverified_status_visible": True, "reapply_available": True,
-                "encrypted_rollback_created": True, "codex_files_unchanged": True,
+                "protected_rollback_created": True, "edit_reapply_verified": True, "codex_files_unchanged": True,
                 "javascript_errors": 0, "console_issues": 0, "horizontal_overflow": False}
     finally:
         if context:

@@ -688,7 +688,9 @@ function ClaudeProviderModal({ profile, onClose, onSaved, notify }) {
         ? `/api/claude-desktop/providers/${profile.id}/edit`
         : "/api/claude-desktop/providers";
       await api(path, { method: "POST", body: JSON.stringify(payload) });
-      notify(editing ? "Claude 供应商已更新" : "Claude 供应商已保存", "success");
+      notify(editing && profile.current
+        ? "Claude 供应商已保存，请重新应用并重启 Claude Desktop"
+        : editing ? "Claude 供应商已更新" : "Claude 供应商已保存", editing && profile.current ? "warning" : "success");
       await onSaved();
       onClose();
     } catch (error) {
